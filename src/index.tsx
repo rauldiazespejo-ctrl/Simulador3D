@@ -167,7 +167,7 @@ INSTRUCCIONES DE DISEÑO:
         'Authorization': `Bearer ${effectiveKey}`
       },
       body: JSON.stringify({
-        model: 'gpt-4o',
+        model: 'gpt-5',
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userContent }
@@ -369,20 +369,54 @@ function validateAndFixScene(scene: any, procedure: string): SceneData {
 }
 
 function generateSceneProcedurally(procedure: string, industry: string): SceneData {
-  const text = procedure.toLowerCase()
+  const text = (procedure + ' ' + industry).toLowerCase()
 
-  // Detect industry keywords
-  const isFood = text.includes('aliment') || text.includes('cocin') || text.includes('food') || text.includes('restaurant')
-  const isMedical = text.includes('médic') || text.includes('hospital') || text.includes('muestra') || text.includes('laborator')
-  const isLogistics = text.includes('almacén') || text.includes('logística') || text.includes('bodega') || text.includes('despacho')
-  const isConstruction = text.includes('obra') || text.includes('construcc') || text.includes('cuadrilla')
+  // Score each industry template
+  const scores: Record<string, number> = {
+    food: 0, medical: 0, logistics: 0, construction: 0,
+    maintenance: 0, manufacturing: 0
+  }
 
-  if (isFood) return SCENE_TEMPLATES.food()
-  if (isMedical) return SCENE_TEMPLATES.medical()
-  if (isLogistics) return SCENE_TEMPLATES.logistics()
-  if (isConstruction) return SCENE_TEMPLATES.construction()
-  if (industry === 'maintenance') return SCENE_TEMPLATES.maintenance()
-  return SCENE_TEMPLATES.manufacturing()
+  // Food keywords
+  const foodKw = ['aliment','cocin','food','restaurant','chef','cocina','menú','menu','ingredien','horno','cocción','emplatad','recipe','kitchen','gastrono','bebida','comida','platillo','culinari']
+  foodKw.forEach(k => { if (text.includes(k)) scores.food += 2 })
+
+  // Medical keywords
+  const medKw = ['médic','hospital','muestra','laborator','patient','enferm','clínic','clinic','analiz','centrifug','sangre','diagnos','triage','farmac','salud','health','biopsia','patolog','microscop']
+  medKw.forEach(k => { if (text.includes(k)) scores.medical += 2 })
+
+  // Logistics/warehouse keywords
+  const logKw = ['almacén','logística','bodega','despacho','envío','picking','warehouse','inventario','pallet','carga','descarga','transporte','distribuc','sorter','wms','fulfillment','shipping','recepción de mercancía','stock']
+  logKw.forEach(k => { if (text.includes(k)) scores.logistics += 2 })
+
+  // Construction keywords
+  const conKw = ['obra','construcc','cuadrilla','cemento','concreto','encofrad','soldad','andamio','architect','plomería','electricist','albañil','losa','muro','cimentac','estructura','acabado']
+  conKw.forEach(k => { if (text.includes(k)) scores.construction += 2 })
+
+  // Maintenance keywords
+  const mntKw = ['mantenimient','reparac','taller','mecánic','mechanic','torno','fresad','soldador','cnc','lubricac','avería','falla','correctivo','preventivo','diagnóstico técnico','motor','repuest','automotriz','automotive','vehículo','vehicle','transmission']
+  mntKw.forEach(k => { if (text.includes(k)) scores.maintenance += 2 })
+
+  // Manufacturing keywords
+  const mfgKw = ['ensambla','manufactur','producción','línea','calidad','qc','operario','planta','troquelad','prensa','robot','conveyor','transportad','inyecc','molde','maquinado','montaje','componente']
+  mfgKw.forEach(k => { if (text.includes(k)) scores.manufacturing += 1 })
+
+  // Industry parameter bonus
+  if (industry === 'food') scores.food += 5
+  if (industry === 'medical' || industry === 'health') scores.medical += 5
+  if (industry === 'logistics') scores.logistics += 5
+  if (industry === 'construction') scores.construction += 5
+  if (industry === 'maintenance') scores.maintenance += 5
+  if (industry === 'automotive') scores.maintenance += 4  // automotive → maintenance template
+  if (industry === 'manufacturing') scores.manufacturing += 3
+  if (industry === 'electronics') scores.manufacturing += 3
+
+  // Find best match
+  const best = Object.entries(scores).sort((a, b) => b[1] - a[1])[0]
+  const template = best[0] as keyof typeof SCENE_TEMPLATES
+
+  return SCENE_TEMPLATES[template]?.()
+    ?? SCENE_TEMPLATES.manufacturing()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -701,8 +735,8 @@ app.get('*', (c) => {
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <script src="https://cdn.tailwindcss.com"></script>
-  <script src="https://cdn.jsdelivr.net/npm/three@0.134.0/build/three.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/three@0.134.0/examples/js/controls/OrbitControls.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.147.0/build/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.147.0/examples/js/controls/OrbitControls.js"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
   <link rel="stylesheet" href="/static/styles.css">
 </head>
