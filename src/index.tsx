@@ -727,22 +727,27 @@ app.get('*', (c) => {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>NexusForge — Industrial Simulation Platform</title>
-  <meta name="description" content="Plataforma profesional de simulación industrial 3D con IA. Genera, analiza y optimiza procesos de trabajo automáticamente desde descripción de procedimientos y planos.">
-  <meta property="og:title" content="NexusForge — Industrial Simulation Platform">
-  <meta property="og:description" content="Genera simulaciones 3D industriales con IA en segundos. Sin código, sin límites.">
+  <title>NexusForge — Simulación Industrial 3D con IA</title>
+  <meta name="description" content="Plataforma profesional de simulación industrial 3D con IA. Describe tu proceso y genera escenas 3D interactivas con operarios, máquinas y KPIs en tiempo real. Alternativa web a FlexSim y AnyLogic.">
+  <meta name="keywords" content="simulación industrial, 3D, IA, manufactura, logística, planta, fábrica, KPI, optimización, proceso">
+  <meta property="og:title" content="NexusForge — Simulación Industrial 3D con IA">
+  <meta property="og:description" content="Describe tu proceso industrial y la IA genera una simulación 3D completa con operarios, máquinas y KPIs. Sin instalación, desde el navegador.">
+  <meta property="og:type" content="website">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="theme-color" content="#f97316">
+  <link rel="icon" type="image/png" href="/static/nexusforge-logo.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-  <script src="https://cdn.tailwindcss.com"></script>
-  <script src="https://cdn.jsdelivr.net/npm/three@0.147.0/build/three.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/three@0.147.0/examples/js/controls/OrbitControls.js"></script>
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,300..900;1,14..32,300..900&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" crossorigin="anonymous">
   <link rel="stylesheet" href="/static/styles.css">
+  <!-- Three.js r147 — global build with OrbitControls -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.147.0/build/three.min.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.147.0/examples/js/controls/OrbitControls.js" crossorigin="anonymous"></script>
 </head>
 <body>
   <div id="root"></div>
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js" defer></script>
 </body>
 </html>`)
 })
