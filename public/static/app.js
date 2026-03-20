@@ -1,7 +1,7 @@
 /**
- * NexusForge — Industrial Simulation Platform v3.0
+ * SimForge3D — Industrial Simulation Platform v3.0
  * Professional 3D Factory Simulation powered by AI
- * © 2026 NexusForge — All rights reserved
+ * © 2026 SimForge3D — All rights reserved
  */
 
 'use strict';
@@ -34,7 +34,7 @@ document.getElementById('root').innerHTML = `
       <span style="font-size:24px;font-weight:900;color:white">NF</span>
     </div>
     <div>
-      <div class="loading-title">NexusForge</div>
+      <div class="loading-title">SimForge3D</div>
       <div class="loading-subtitle">Industrial Simulation Platform</div>
     </div>
   </div>
@@ -364,7 +364,7 @@ Ejemplo: 'Línea de ensamble con 3 operarios. El operario A recoge piezas del al
     </h1>
 
     <p class="land-sub">
-      Describe tu proceso de trabajo con texto o sube un plano y NexusForge genera una simulación 3D interactiva con operarios, máquinas y KPIs en tiempo real.
+      Describe tu proceso de trabajo con texto o sube un plano y SimForge3D genera una simulación 3D interactiva con operarios, máquinas y KPIs en tiempo real.
     </p>
 
     <div class="land-ctas">
@@ -432,14 +432,14 @@ Ejemplo: 'Línea de ensamble con 3 operarios. El operario A recoge piezas del al
 
     <!-- Comparison vs competitors -->
     <div class="land-compare">
-      <h2 class="land-h2">Por qué NexusForge</h2>
+      <h2 class="land-h2">Por qué SimForge3D</h2>
       <table class="compare-table">
         <thead>
           <tr>
             <th>Característica</th>
             <th style="color:var(--nf-t4)">FlexSim</th>
             <th style="color:var(--nf-t4)">AnyLogic</th>
-            <th class="compare-highlight" style="color:var(--nf-primary)">NexusForge</th>
+            <th class="compare-highlight" style="color:var(--nf-primary)">SimForge3D</th>
           </tr>
         </thead>
         <tbody>
@@ -546,7 +546,7 @@ Ejemplo: 'Línea de ensamble con 3 operarios. El operario A recoge piezas del al
         </div>
         <div class="testimonial-card">
           <div class="testimonial-stars">★★★★★</div>
-          <div class="testimonial-quote">"Usamos NexusForge para presentar rediseños de planta a clientes. El impacto visual 3D convence en segundos lo que antes requería costosas maquetas."</div>
+          <div class="testimonial-quote">"Usamos SimForge3D para presentar rediseños de planta a clientes. El impacto visual 3D convence en segundos lo que antes requería costosas maquetas."</div>
           <div class="testimonial-author">
             <div class="testimonial-avatar">CL</div>
             <div>
@@ -609,7 +609,7 @@ window.addEventListener('DOMContentLoaded', () => {
     const loadWrap = document.getElementById('loading-logo-wrap');
     if (loadWrap) { loadWrap.innerHTML = ''; const img3 = logoImg.cloneNode(); img3.style.cssText = 'width:38px;height:38px;object-fit:contain'; loadWrap.appendChild(img3); }
   };
-  logoImg.src = '/static/nexusforge-logo.png';
+  logoImg.src = '/static/simforge3d-logo.png';
 
   restoreApiKey();
 
@@ -1795,14 +1795,14 @@ async function loadProjectSims(projectId) {
 function exportScene() {
   if (!NF.currentScene) { showToast('Genera una simulación primero', 'error'); return; }
   const blob = new Blob([JSON.stringify(NF.currentScene, null, 2)], { type: 'application/json' });
-  downloadBlob(blob, `nexusforge_scene_${Date.now()}.json`);
+  downloadBlob(blob, `simforge3d_scene_${Date.now()}.json`);
   showToast('Escena exportada como JSON', 'success');
 }
 
 function exportReport() {
   if (!NF.currentScene) { showToast('Genera una simulación primero', 'error'); return; }
   const report = {
-    platform: 'NexusForge v3.0',
+    platform: 'SimForge3D v3.0',
     generated: new Date().toISOString(),
     title: NF.currentScene.title,
     description: NF.currentScene.description,
@@ -1819,7 +1819,7 @@ function exportReport() {
     activityLog: NF.logEntries.slice(-100)
   };
   const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
-  downloadBlob(blob, `nexusforge_report_${Date.now()}.json`);
+  downloadBlob(blob, `simforge3d_report_${Date.now()}.json`);
   showToast('Informe KPI exportado', 'success');
 }
 

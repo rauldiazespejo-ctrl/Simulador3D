@@ -1,5 +1,5 @@
 -- ═══════════════════════════════════════════════════════════════════════════
--- NexusForge — Supabase Schema v1.0
+-- SimForge3D — Supabase Schema v1.0
 -- Ejecutar en: Supabase Dashboard → SQL Editor → New Query
 -- ═══════════════════════════════════════════════════════════════════════════
 

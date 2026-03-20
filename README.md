@@ -1,4 +1,4 @@
-# NexusForge — Simulación Industrial 3D con IA
+# SimForge3D — Simulación Industrial 3D con IA
 ## Stack: Next.js 16 + Supabase PostgreSQL + Vercel
 
 ---
@@ -30,7 +30,7 @@
 > Sin Supabase, la app funciona con fallback procedimental (sin persistencia)
 
 ### 1 — Crear proyecto Supabase
-1. Ve a **https://app.supabase.com** → **New project** → nombre: `nexusforge`
+1. Ve a **https://app.supabase.com** → **New project** → nombre: `simforge3d`
 2. Espera ~2 min a que el proyecto esté listo
 
 ### 2 — Ejecutar schema SQL
@@ -89,8 +89,8 @@ nexusforge-vercel/
 │   └── supabase.ts                       # Cliente PostgreSQL tipado
 ├── public/static/
 │   ├── app.js                           # Three.js SPA (~85KB)
-│   ├── styles.css                       # Design system NexusForge (~35KB)
-│   └── nexusforge-logo.png
+│   ├── styles.css                       # Design system SimForge3D (~35KB)
+│   └── simforge3d-logo.png
 ├── supabase-schema.sql                  # Schema listo para SQL Editor
 ├── vercel.json                          # Config framework + region
 └── next.config.ts                       # ignoreBuildErrors
