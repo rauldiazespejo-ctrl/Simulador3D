@@ -5,11 +5,7 @@ const nextConfig: NextConfig = {
     unoptimized: true,
   },
   typescript: {
-    // Skip type checking during build (Vercel does its own type check)
     ignoreBuildErrors: true,
-  },
-  eslint: {
-    ignoreDuringBuilds: true,
   },
 }
 
