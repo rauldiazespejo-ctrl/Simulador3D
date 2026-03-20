@@ -2,562 +2,712 @@ import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { serveStatic } from 'hono/cloudflare-workers'
 
+// ─── TYPES ─────────────────────────────────────────────────────────────────
 type Bindings = {
+  DB: D1Database
   OPENAI_API_KEY: string
   OPENAI_BASE_URL: string
+}
+
+type SceneZone = {
+  id: string; name: string; type: string
+  x: number; z: number; width: number; depth: number; height: number
+  color: string; label: string
+}
+type SceneMachine = {
+  id: string; name: string; type: string
+  x: number; z: number; width: number; depth: number; height: number
+  color: string; animated: boolean
+}
+type WorkerRoute = {
+  step: number; action: string; targetX: number; targetZ: number
+  duration: number; description: string; zone: string
+}
+type SceneWorker = {
+  id: string; name: string; color: string; helmetColor: string
+  startX: number; startZ: number; route: WorkerRoute[]
+}
+type SceneData = {
+  title: string; description: string
+  environment: { width: number; depth: number; floorColor: string; wallColor: string; ceilingHeight: number }
+  zones: SceneZone[]; machines: SceneMachine[]; workers: SceneWorker[]
+  kpis: { cycleTime: number; workersCount: number; zonesCount: number; machinesCount: number; efficiency: number; throughput: number }
+  steps: string[]; bottlenecks: string[]; improvements: string[]
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
 app.use('*', cors())
 
-// ─── SYSTEM PROMPT ─────────────────────────────────────────────────────────
-const SYSTEM_PROMPT = `Eres un experto en simulación industrial 3D y ergonomía laboral.
-Tu tarea es analizar un procedimiento de trabajo y generar una configuración JSON
-para una simulación 3D interactiva con Three.js.
+// ═══════════════════════════════════════════════════════════════════════════
+// PROJECTS API
+// ═══════════════════════════════════════════════════════════════════════════
 
-Responde ÚNICAMENTE con un JSON válido con esta estructura exacta (sin markdown, sin explicaciones):
+app.get('/api/projects', async (c) => {
+  const { DB } = c.env
+  const { results } = await DB.prepare(`
+    SELECT p.*, 
+      (SELECT COUNT(*) FROM simulations s WHERE s.project_id = p.id) AS simulations_count,
+      (SELECT MAX(s.created_at) FROM simulations s WHERE s.project_id = p.id) AS last_simulation
+    FROM projects p
+    WHERE p.status != 'archived'
+    ORDER BY p.updated_at DESC
+    LIMIT 50
+  `).all()
+  return c.json({ success: true, projects: results })
+})
 
+app.post('/api/projects', async (c) => {
+  const { DB } = c.env
+  const { name, description, industry } = await c.req.json()
+  if (!name?.trim()) return c.json({ error: 'name required' }, 400)
+  const id = crypto.randomUUID().replace(/-/g, '').slice(0, 16)
+  await DB.prepare(`
+    INSERT INTO projects (id, name, description, industry)
+    VALUES (?, ?, ?, ?)
+  `).bind(id, name.trim(), description || '', industry || 'manufacturing').run()
+  const project = await DB.prepare('SELECT * FROM projects WHERE id=?').bind(id).first()
+  return c.json({ success: true, project }, 201)
+})
+
+app.put('/api/projects/:id', async (c) => {
+  const { DB } = c.env
+  const id = c.req.param('id')
+  const body = await c.req.json()
+  const fields: string[] = [], vals: unknown[] = []
+  if (body.name) { fields.push('name=?'); vals.push(body.name) }
+  if (body.description !== undefined) { fields.push('description=?'); vals.push(body.description) }
+  if (body.industry) { fields.push('industry=?'); vals.push(body.industry) }
+  if (body.status) { fields.push('status=?'); vals.push(body.status) }
+  if (!fields.length) return c.json({ error: 'nothing to update' }, 400)
+  fields.push('updated_at=?'); vals.push(new Date().toISOString())
+  vals.push(id)
+  await DB.prepare(`UPDATE projects SET ${fields.join(',')} WHERE id=?`).bind(...vals).run()
+  const project = await DB.prepare('SELECT * FROM projects WHERE id=?').bind(id).first()
+  return c.json({ success: true, project })
+})
+
+app.delete('/api/projects/:id', async (c) => {
+  const { DB } = c.env
+  const id = c.req.param('id')
+  await DB.prepare(`UPDATE projects SET status='archived', updated_at=? WHERE id=?`)
+    .bind(new Date().toISOString(), id).run()
+  return c.json({ success: true })
+})
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SIMULATIONS API
+// ═══════════════════════════════════════════════════════════════════════════
+
+app.get('/api/projects/:id/simulations', async (c) => {
+  const { DB } = c.env
+  const projectId = c.req.param('id')
+  const { results } = await DB.prepare(`
+    SELECT * FROM simulations WHERE project_id=? ORDER BY created_at DESC LIMIT 30
+  `).bind(projectId).all()
+  return c.json({ success: true, simulations: results })
+})
+
+app.get('/api/simulations/:id', async (c) => {
+  const { DB } = c.env
+  const id = c.req.param('id')
+  const sim = await DB.prepare('SELECT * FROM simulations WHERE id=?').bind(id).first()
+  if (!sim) return c.json({ error: 'not found' }, 404)
+  return c.json({ success: true, simulation: sim })
+})
+
+app.delete('/api/simulations/:id', async (c) => {
+  const { DB } = c.env
+  const id = c.req.param('id')
+  await DB.prepare('DELETE FROM simulations WHERE id=?').bind(id).run()
+  return c.json({ success: true })
+})
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AI GENERATION API — CORE FEATURE
+// ═══════════════════════════════════════════════════════════════════════════
+
+app.post('/api/generate', async (c) => {
+  const { DB, OPENAI_API_KEY, OPENAI_BASE_URL } = c.env
+  const body = await c.req.json()
+  const { procedure, floorPlanBase64, industry, projectId, apiKey } = body
+
+  if (!procedure?.trim()) return c.json({ error: 'procedure required' }, 400)
+
+  const effectiveKey = apiKey || OPENAI_API_KEY
+  const baseUrl = OPENAI_BASE_URL || 'https://www.genspark.ai/api/llm_proxy/v1'
+
+  if (!effectiveKey) return c.json({ error: 'API key required' }, 401)
+
+  try {
+    const systemPrompt = `Eres un arquitecto de simulaciones industriales 3D experto. 
+Analizas procedimientos de trabajo y generas configuraciones de escena 3D detalladas.
+SIEMPRE responde ÚNICAMENTE con JSON válido, sin markdown, sin explicaciones.
+El JSON debe ser la configuración completa de la escena.
+
+INSTRUCCIONES DE DISEÑO:
+- Usa coordenadas X entre -15 y 15, Z entre -10 y 10
+- Colores como strings hex (#rrggbb)
+- Las zonas NO deben superponerse
+- Los workers deben tener rutas realistas y coherentes con el procedimiento
+- Las máquinas deben estar dentro de las zonas correspondientes
+- Los KPIs deben ser realistas según el proceso descrito
+- Genera EXACTAMENTE el JSON con esta estructura`
+
+    const userContent = floorPlanBase64
+      ? [
+          { type: 'text', text: buildUserPrompt(procedure, industry) },
+          { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${floorPlanBase64}` } }
+        ]
+      : buildUserPrompt(procedure, industry)
+
+    const response = await fetch(`${baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${effectiveKey}`
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userContent }
+        ],
+        temperature: 0.7,
+        max_tokens: 4000,
+        response_format: { type: 'json_object' }
+      })
+    })
+
+    if (!response.ok) {
+      const err = await response.text()
+      console.error('OpenAI error:', err)
+      // Fall back to procedural generation
+      const scene = generateSceneProcedurally(procedure, industry || 'manufacturing')
+      return c.json({ success: true, scene, source: 'procedural' })
+    }
+
+    const data: any = await response.json()
+    const content = data.choices?.[0]?.message?.content
+    if (!content) throw new Error('Empty response from AI')
+
+    let scene: SceneData
+    try {
+      scene = JSON.parse(content)
+    } catch {
+      scene = generateSceneProcedurally(procedure, industry || 'manufacturing')
+      return c.json({ success: true, scene, source: 'procedural' })
+    }
+
+    // Validate and fix scene
+    scene = validateAndFixScene(scene, procedure)
+
+    // Save to DB if projectId provided
+    if (projectId && DB) {
+      try {
+        const simId = crypto.randomUUID().replace(/-/g, '').slice(0, 16)
+        const name = scene.title || procedure.slice(0, 80)
+        await DB.prepare(`
+          INSERT INTO simulations (id, project_id, name, procedure, scene_json, workers_count, zones_count, efficiency, cycle_time)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).bind(
+          simId, projectId, name, procedure,
+          JSON.stringify(scene),
+          scene.workers?.length || 0,
+          scene.zones?.length || 0,
+          scene.kpis?.efficiency || 75,
+          scene.kpis?.cycleTime || 15
+        ).run()
+        await DB.prepare(`UPDATE projects SET updated_at=? WHERE id=?`)
+          .bind(new Date().toISOString(), projectId).run()
+        return c.json({ success: true, scene, simulationId: simId, source: 'ai' })
+      } catch (dbErr) {
+        console.error('DB save error:', dbErr)
+      }
+    }
+
+    return c.json({ success: true, scene, source: 'ai' })
+  } catch (err: any) {
+    console.error('Generation error:', err)
+    // Always fallback to procedural
+    const scene = generateSceneProcedurally(procedure, industry || 'manufacturing')
+    return c.json({ success: true, scene, source: 'procedural' })
+  }
+})
+
+// Save simulation run KPIs
+app.post('/api/simulations/:id/runs', async (c) => {
+  const { DB } = c.env
+  const simId = c.req.param('id')
+  const { duration, oee, throughput, unitsProduced, failures, kpis } = await c.req.json()
+  const runId = crypto.randomUUID().replace(/-/g, '').slice(0, 16)
+  await DB.prepare(`
+    INSERT INTO simulation_runs (id, simulation_id, duration_sec, oee, throughput, units_produced, failures, kpi_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).bind(runId, simId, duration || 0, oee || 0, throughput || 0, unitsProduced || 0, failures || 0, JSON.stringify(kpis || {})).run()
+  return c.json({ success: true, runId })
+})
+
+// Dashboard stats
+app.get('/api/stats', async (c) => {
+  const { DB } = c.env
+  const [projects, simulations, runs] = await Promise.all([
+    DB.prepare("SELECT COUNT(*) as count FROM projects WHERE status='active'").first<{ count: number }>(),
+    DB.prepare("SELECT COUNT(*) as count FROM simulations").first<{ count: number }>(),
+    DB.prepare("SELECT COUNT(*) as count, AVG(oee) as avg_oee, AVG(throughput) as avg_throughput FROM simulation_runs").first<{ count: number; avg_oee: number; avg_throughput: number }>()
+  ])
+  return c.json({
+    success: true,
+    stats: {
+      projects: projects?.count || 0,
+      simulations: simulations?.count || 0,
+      runs: runs?.count || 0,
+      avgOee: Math.round((runs?.avg_oee || 0) * 10) / 10,
+      avgThroughput: Math.round(runs?.avg_throughput || 0)
+    }
+  })
+})
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+function buildUserPrompt(procedure: string, industry: string): string {
+  return `Analiza este procedimiento de trabajo y genera una escena 3D industrial completa.
+
+PROCEDIMIENTO:
+${procedure}
+
+INDUSTRIA: ${industry || 'manufacturing'}
+
+Genera un JSON con esta estructura EXACTA:
 {
-  "title": "Nombre de la simulación",
-  "description": "Descripción breve",
+  "title": "Título descriptivo del proceso",
+  "description": "Descripción breve del proceso",
   "environment": {
     "width": 30,
     "depth": 20,
-    "floorColor": "#1a2a1a",
-    "wallColor": "#1e3a5f",
-    "ambientColor": "#334466"
+    "floorColor": "#1a1a2e",
+    "wallColor": "#0f3460",
+    "ceilingHeight": 5
   },
   "zones": [
     {
-      "id": "zone_1",
-      "name": "Almacén",
-      "type": "storage",
-      "x": -12,
-      "z": -7,
-      "width": 5,
-      "depth": 4,
-      "height": 0.1,
-      "color": "#1a3a2a",
-      "label": "Almacén"
+      "id": "z1",
+      "name": "Nombre zona",
+      "type": "entry|workstation|assembly|inspection|storage|exit|office|quality",
+      "x": 0, "z": 0,
+      "width": 5, "depth": 4, "height": 0.08,
+      "color": "#2a4a6a",
+      "label": "Etiqueta corta"
     }
   ],
   "machines": [
     {
-      "id": "machine_1",
-      "name": "Mesa de trabajo",
-      "type": "table",
-      "x": 0,
-      "z": 0,
-      "width": 2,
-      "depth": 1.2,
-      "height": 0.8,
-      "color": "#886633",
-      "animated": false
+      "id": "m1",
+      "name": "Nombre máquina",
+      "type": "conveyor|press|oven|computer|table|shelf|lathe|cnc|welder|crane|scanner",
+      "x": 0, "z": 0,
+      "width": 1.5, "depth": 1.0, "height": 1.2,
+      "color": "#556677",
+      "animated": true
     }
   ],
   "workers": [
     {
-      "id": "worker_1",
-      "name": "Operario 1",
-      "color": "#3355aa",
-      "startX": -10,
-      "startZ": -5,
+      "id": "w1",
+      "name": "Nombre operario",
+      "color": "#2255aa",
+      "helmetColor": "#4477cc",
+      "startX": -10, "startZ": -5,
       "route": [
         {
           "step": 1,
-          "action": "walk",
-          "targetX": -10,
-          "targetZ": -5,
-          "duration": 3,
-          "description": "Se dirige al almacén",
-          "zone": "zone_1"
-        },
-        {
-          "step": 2,
-          "action": "work",
-          "targetX": -10,
-          "targetZ": -5,
+          "action": "walk|work|carry|inspect|repair|idle",
+          "targetX": -10, "targetZ": -5,
           "duration": 4,
-          "description": "Recoge materiales",
-          "zone": "zone_1"
-        },
-        {
-          "step": 3,
-          "action": "carry",
-          "targetX": 0,
-          "targetZ": 0,
-          "duration": 3,
-          "description": "Traslada a la mesa de trabajo",
-          "zone": "zone_2"
-        },
-        {
-          "step": 4,
-          "action": "work",
-          "targetX": 0,
-          "targetZ": 0,
-          "duration": 5,
-          "description": "Ensambla el componente",
-          "zone": "zone_2"
+          "description": "Descripción de la acción",
+          "zone": "z1"
         }
       ]
     }
   ],
   "kpis": {
     "cycleTime": 15,
-    "workersCount": 1,
-    "zonesCount": 3,
-    "efficiency": 78
+    "workersCount": 3,
+    "zonesCount": 6,
+    "machinesCount": 5,
+    "efficiency": 82,
+    "throughput": 240
   },
-  "steps": [
-    "Paso 1: El operario recoge materiales del almacén",
-    "Paso 2: Traslada materiales a la mesa de trabajo",
-    "Paso 3: Ensambla el componente",
-    "Paso 4: Lleva el producto terminado al área de despacho"
-  ]
+  "steps": ["Paso 1", "Paso 2", "Paso 3"],
+  "bottlenecks": ["Descripción del cuello de botella"],
+  "improvements": ["Mejora sugerida 1", "Mejora sugerida 2"]
 }
 
-REGLAS CRÍTICAS:
-- Las coordenadas x,z deben estar dentro del entorno: x entre -(width/2)+2 y (width/2)-2, z entre -(depth/2)+2 y (depth/2)-2
-- Coloca los elementos de forma coherente con el procedimiento
-- Si hay plano adjunto, úsalo para la distribución espacial
-- Genera 2-4 trabajadores según la complejidad
-- Genera 3-7 zonas bien distribuidas por el espacio
-- Genera 3-6 máquinas/equipos
-- Cada trabajador tiene ruta de 4-8 pasos que forman un ciclo completo (el último paso regresa al inicio)
-- IMPORTANTE: El paso final de cada trabajador debe llevar de vuelta a startX, startZ
-- Usa colores hexadecimales oscuros e industriales
-- Responde SOLO con el JSON, sin \`\`\`json, sin texto adicional`
+IMPORTANTE: Genera al menos 3 workers, 5 zonas y 4 máquinas. Las rutas deben ser coherentes con el procedimiento.`
+}
 
-// ─── API: Generate scene ───────────────────────────────────────────────────
-app.post('/api/generate', async (c) => {
-  // Accept API key from env OR from request header (user-provided)
-  const apiKey = c.env?.OPENAI_API_KEY || c.req.header('X-API-Key') || ''
-  const baseURL = c.env?.OPENAI_BASE_URL || 'https://www.genspark.ai/api/llm_proxy/v1'
-
-  let procedure = ''
-  let floorPlanBase64 = ''
-  let floorPlanMimeType = ''
-
-  const contentType = c.req.header('content-type') || ''
-  if (contentType.includes('multipart/form-data')) {
-    const formData = await c.req.formData()
-    procedure = (formData.get('procedure') as string) || ''
-    const file = formData.get('floorPlan') as File | null
-    if (file) {
-      const buffer = await file.arrayBuffer()
-      floorPlanBase64 = btoa(String.fromCharCode(...new Uint8Array(buffer)))
-      floorPlanMimeType = file.type || 'image/png'
-    }
-  } else {
-    const body = await c.req.json()
-    procedure = body.procedure || ''
+function validateAndFixScene(scene: any, procedure: string): SceneData {
+  if (!scene.environment) {
+    scene.environment = { width: 30, depth: 20, floorColor: '#1a1a2e', wallColor: '#0f3460', ceilingHeight: 5 }
   }
-
-  if (!procedure) return c.json({ error: 'procedure is required' }, 400)
-
-  // If no API key, return demo scene based on keywords
-  if (!apiKey || apiKey === 'demo') {
-    const demo = generateDemoScene(procedure)
-    return c.json({ success: true, scene: demo, demo: true })
+  if (!Array.isArray(scene.zones) || scene.zones.length === 0) {
+    scene = generateSceneProcedurally(procedure, 'manufacturing')
+    return scene
   }
-
-  const userContent: any[] = [{
-    type: 'text',
-    text: `Procedimiento de trabajo a simular:\n\n${procedure}`
-  }]
-
-  if (floorPlanBase64) {
-    userContent.push({
-      type: 'image_url',
-      image_url: { url: `data:${floorPlanMimeType};base64,${floorPlanBase64}`, detail: 'high' }
-    })
-    userContent.push({
-      type: 'text',
-      text: 'El plano/croquis adjunto muestra la distribución espacial. Úsalo para posicionar los elementos.'
-    })
+  if (!Array.isArray(scene.workers) || scene.workers.length === 0) {
+    scene = generateSceneProcedurally(procedure, 'manufacturing')
+    return scene
   }
-
-  try {
-    const response = await fetch(`${baseURL}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`
-      },
-      body: JSON.stringify({
-        model: 'gpt-5',
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: userContent }
-        ],
-        max_tokens: 4000,
-        temperature: 0.3
-      })
-    })
-
-    if (!response.ok) {
-      const err = await response.text()
-      // Fallback to demo if API fails
-      const demo = generateDemoScene(procedure)
-      return c.json({ success: true, scene: demo, demo: true, apiError: err })
-    }
-
-    const data: any = await response.json()
-    const raw = data.choices?.[0]?.message?.content || ''
-    let jsonStr = raw.trim()
-    const match = raw.match(/```(?:json)?\s*([\s\S]*?)```/)
-    if (match) jsonStr = match[1].trim()
-
-    const sceneConfig = JSON.parse(jsonStr)
-    return c.json({ success: true, scene: sceneConfig })
-  } catch (e: any) {
-    // Fallback to demo scene
-    const demo = generateDemoScene(procedure)
-    return c.json({ success: true, scene: demo, demo: true })
+  if (!scene.kpis) {
+    scene.kpis = { cycleTime: 15, workersCount: scene.workers?.length || 2, zonesCount: scene.zones?.length || 4, machinesCount: scene.machines?.length || 3, efficiency: 78, throughput: 200 }
   }
-})
+  if (!Array.isArray(scene.steps)) scene.steps = []
+  if (!Array.isArray(scene.bottlenecks)) scene.bottlenecks = []
+  if (!Array.isArray(scene.improvements)) scene.improvements = []
+  return scene as SceneData
+}
 
-// ─── API: Refine scene ─────────────────────────────────────────────────────
-app.post('/api/refine', async (c) => {
-  const apiKey = c.env?.OPENAI_API_KEY || c.req.header('X-API-Key') || ''
-  const baseURL = c.env?.OPENAI_BASE_URL || 'https://www.genspark.ai/api/llm_proxy/v1'
-  const { scene, instruction } = await c.req.json()
-  if (!scene || !instruction) return c.json({ error: 'scene and instruction required' }, 400)
-
-  if (!apiKey || apiKey === 'demo') {
-    return c.json({ success: true, scene, demo: true })
-  }
-
-  try {
-    const response = await fetch(`${baseURL}/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model: 'gpt-5',
-        messages: [
-          { role: 'system', content: 'Eres experto en simulación 3D industrial. Modifica el JSON de configuración según la instrucción. Responde ÚNICAMENTE con el JSON modificado válido, sin markdown.' },
-          { role: 'user', content: `Instrucción: ${instruction}\n\nEscena:\n${JSON.stringify(scene, null, 2)}` }
-        ],
-        max_tokens: 4000,
-        temperature: 0.2
-      })
-    })
-    const data: any = await response.json()
-    const raw = data.choices?.[0]?.message?.content || ''
-    let jsonStr = raw.trim()
-    const match = raw.match(/```(?:json)?\s*([\s\S]*?)```/)
-    if (match) jsonStr = match[1].trim()
-    return c.json({ success: true, scene: JSON.parse(jsonStr) })
-  } catch {
-    return c.json({ success: true, scene, demo: true })
-  }
-})
-
-// ─── DEMO SCENE GENERATOR ─────────────────────────────────────────────────
-function generateDemoScene(procedure: string) {
+function generateSceneProcedurally(procedure: string, industry: string): SceneData {
   const text = procedure.toLowerCase()
 
-  // Detect scenario type
-  const isWarehouse = text.includes('almacén') || text.includes('logístic') || text.includes('despacho') || text.includes('bodega')
-  const isKitchen = text.includes('cocina') || text.includes('alimento') || text.includes('cocinero') || text.includes('gastronomía')
-  const isMedical = text.includes('laborator') || text.includes('médic') || text.includes('clínic') || text.includes('muestra') || text.includes('salud')
-  const isMaintenance = text.includes('mantenimiento') || text.includes('reparación') || text.includes('taller')
+  // Detect industry keywords
+  const isFood = text.includes('aliment') || text.includes('cocin') || text.includes('food') || text.includes('restaurant')
+  const isMedical = text.includes('médic') || text.includes('hospital') || text.includes('muestra') || text.includes('laborator')
+  const isLogistics = text.includes('almacén') || text.includes('logística') || text.includes('bodega') || text.includes('despacho')
+  const isConstruction = text.includes('obra') || text.includes('construcc') || text.includes('cuadrilla')
 
-  if (isWarehouse) return DEMO_SCENES.warehouse(procedure)
-  if (isKitchen) return DEMO_SCENES.kitchen(procedure)
-  if (isMedical) return DEMO_SCENES.medical(procedure)
-  if (isMaintenance) return DEMO_SCENES.maintenance(procedure)
-  return DEMO_SCENES.assembly(procedure)
+  if (isFood) return SCENE_TEMPLATES.food()
+  if (isMedical) return SCENE_TEMPLATES.medical()
+  if (isLogistics) return SCENE_TEMPLATES.logistics()
+  if (isConstruction) return SCENE_TEMPLATES.construction()
+  if (industry === 'maintenance') return SCENE_TEMPLATES.maintenance()
+  return SCENE_TEMPLATES.manufacturing()
 }
 
-const DEMO_SCENES = {
-  assembly: (p: string) => ({
-    title: 'Línea de Ensamblaje Industrial',
-    description: p.substring(0, 80) + '...',
-    environment: { width: 30, depth: 20, floorColor: '#1a2a1a', wallColor: '#1e3a5f', ambientColor: '#334466' },
+// ═══════════════════════════════════════════════════════════════════════════
+// SCENE TEMPLATES
+// ═══════════════════════════════════════════════════════════════════════════
+
+const SCENE_TEMPLATES: Record<string, () => SceneData> = {
+  manufacturing: () => ({
+    title: 'Planta de Ensamble — Línea de Producción',
+    description: 'Línea de ensamble industrial con control de calidad automatizado y gestión de materiales.',
+    environment: { width: 34, depth: 22, floorColor: '#0d1117', wallColor: '#161b22', ceilingHeight: 6 },
     zones: [
-      { id: 'z1', name: 'Almacén', type: 'storage', x: -12, z: -7, width: 5, depth: 4, height: 0.1, color: '#1a3a2a', label: 'Almacén' },
-      { id: 'z2', name: 'Estación A', type: 'workstation', x: -4, z: 0, width: 4, depth: 4, height: 0.1, color: '#1a2a3a', label: 'Ensamblaje A' },
-      { id: 'z3', name: 'Estación B', type: 'assembly', x: 4, z: 0, width: 4, depth: 4, height: 0.1, color: '#1a2a4a', label: 'Ensamblaje B' },
-      { id: 'z4', name: 'Control Calidad', type: 'inspection', x: 10, z: -5, width: 4, depth: 3, height: 0.1, color: '#2a2a1a', label: 'C. Calidad' },
-      { id: 'z5', name: 'Despacho', type: 'exit', x: 12, z: 7, width: 4, depth: 3, height: 0.1, color: '#1a1a3a', label: 'Despacho' }
+      { id: 'z1', name: 'Almacén MP', type: 'storage', x: -14, z: -8, width: 5, depth: 4, height: 0.08, color: '#1e3a4c', label: 'Almacén' },
+      { id: 'z2', name: 'Pre-ensamble', type: 'workstation', x: -6, z: -5, width: 5, depth: 4, height: 0.08, color: '#1e4c3a', label: 'Pre-ens.' },
+      { id: 'z3', name: 'Ensamble Principal', type: 'assembly', x: 2, z: -4, width: 6, depth: 6, height: 0.08, color: '#3a4c1e', label: 'Ensamble' },
+      { id: 'z4', name: 'Control Calidad', type: 'inspection', x: 10, z: -3, width: 5, depth: 5, height: 0.08, color: '#4c3a1e', label: 'QC' },
+      { id: 'z5', name: 'Packaging', type: 'assembly', x: -8, z: 6, width: 5, depth: 4, height: 0.08, color: '#2a1e4c', label: 'Packaging' },
+      { id: 'z6', name: 'Despacho', type: 'exit', x: 6, z: 7, width: 5, depth: 4, height: 0.08, color: '#4c1e2a', label: 'Despacho' },
     ],
     machines: [
-      { id: 'm1', name: 'Mesa Ensamble A', type: 'table', x: -4, z: 0, width: 2, depth: 1.2, height: 0.8, color: '#886633', animated: false },
-      { id: 'm2', name: 'Mesa Ensamble B', type: 'table', x: 4, z: 0, width: 2, depth: 1.2, height: 0.8, color: '#886644', animated: false },
-      { id: 'm3', name: 'Prensa Hidráulica', type: 'press', x: 0, z: -6, width: 1.5, depth: 1.5, height: 2, color: '#445566', animated: true },
-      { id: 'm4', name: 'Estante Piezas', type: 'shelf', x: -12, z: -5, width: 3, depth: 0.5, height: 2.5, color: '#664422', animated: false },
-      { id: 'm5', name: 'Robot Soldador', type: 'robot', x: 2, z: 3, width: 0.8, depth: 0.8, height: 2.5, color: '#336688', animated: true }
+      { id: 'm1', name: 'Transportador A', type: 'conveyor', x: -2, z: -3, width: 4, depth: 0.8, height: 0.9, color: '#4a5568', animated: true },
+      { id: 'm2', name: 'Prensa Hidráulica', type: 'press', x: 2, z: -4, width: 1.8, depth: 1.5, height: 2.2, color: '#2d4a6e', animated: true },
+      { id: 'm3', name: 'Robot Ensamble', type: 'cnc', x: 4, z: -2, width: 1.2, depth: 1.2, height: 2.5, color: '#3d6e4a', animated: true },
+      { id: 'm4', name: 'Mesa Inspección', type: 'table', x: 10, z: -3, width: 2.5, depth: 1.5, height: 0.9, color: '#6e4a2d', animated: false },
+      { id: 'm5', name: 'Scanner QR', type: 'scanner', x: 12, z: -2, width: 0.3, depth: 0.3, height: 1.5, color: '#334455', animated: false },
+      { id: 'm6', name: 'Selladora', type: 'press', x: -8, z: 6, width: 1.5, depth: 1.2, height: 1.4, color: '#554433', animated: false },
     ],
     workers: [
-      {
-        id: 'w1', name: 'Operario 1', color: '#3355cc', startX: -12, startZ: -7,
+      { id: 'w1', name: 'Op. Almacén', color: '#3b82f6', helmetColor: '#60a5fa', startX: -14, startZ: -8,
         route: [
-          { step: 1, action: 'walk', targetX: -12, targetZ: -5, duration: 3, description: 'Va al almacén', zone: 'z1' },
-          { step: 2, action: 'work', targetX: -12, targetZ: -5, duration: 3, description: 'Recoge piezas', zone: 'z1' },
-          { step: 3, action: 'carry', targetX: -4, targetZ: 0, duration: 4, description: 'Transporta a Estación A', zone: 'z2' },
-          { step: 4, action: 'work', targetX: -4, targetZ: 0, duration: 5, description: 'Ensambla componente', zone: 'z2' },
-          { step: 5, action: 'carry', targetX: 10, targetZ: -5, duration: 3, description: 'Lleva a Control de Calidad', zone: 'z4' },
-          { step: 6, action: 'inspect', targetX: 10, targetZ: -5, duration: 3, description: 'Inspección', zone: 'z4' },
-          { step: 7, action: 'walk', targetX: -12, targetZ: -7, duration: 4, description: 'Regresa al inicio', zone: 'z1' }
-        ]
-      },
-      {
-        id: 'w2', name: 'Operario 2', color: '#cc5533', startX: 4, startZ: -3,
+          { step: 1, action: 'work', targetX: -14, targetZ: -8, duration: 4, description: 'Prepara materiales', zone: 'z1' },
+          { step: 2, action: 'carry', targetX: -6, targetZ: -5, duration: 3, description: 'Lleva materiales a pre-ensamble', zone: 'z2' },
+          { step: 3, action: 'walk', targetX: -14, targetZ: -8, duration: 3, description: 'Regresa al almacén', zone: 'z1' },
+        ] },
+      { id: 'w2', name: 'Operario Ensamble', color: '#10b981', helmetColor: '#34d399', startX: 2, startZ: -4,
         route: [
-          { step: 1, action: 'work', targetX: 4, targetZ: 0, duration: 6, description: 'Ensambla en Estación B', zone: 'z3' },
-          { step: 2, action: 'inspect', targetX: 4, targetZ: 0, duration: 2, description: 'Verifica calidad', zone: 'z3' },
-          { step: 3, action: 'carry', targetX: 12, targetZ: 7, duration: 3, description: 'Lleva al despacho', zone: 'z5' },
-          { step: 4, action: 'walk', targetX: 4, targetZ: -3, duration: 4, description: 'Regresa a Estación B', zone: 'z3' }
-        ]
-      },
-      {
-        id: 'w3', name: 'Inspector', color: '#33aa55', startX: 10, startZ: -5,
+          { step: 1, action: 'work', targetX: 2, targetZ: -4, duration: 6, description: 'Ensambla componentes', zone: 'z3' },
+          { step: 2, action: 'carry', targetX: 10, targetZ: -3, duration: 2, description: 'Lleva a QC', zone: 'z4' },
+          { step: 3, action: 'walk', targetX: 2, targetZ: -4, duration: 2, description: 'Regresa a ensamble', zone: 'z3' },
+        ] },
+      { id: 'w3', name: 'Inspector QC', color: '#f59e0b', helmetColor: '#fbbf24', startX: 10, startZ: -3,
         route: [
-          { step: 1, action: 'inspect', targetX: 10, targetZ: -5, duration: 5, description: 'Inspección de calidad', zone: 'z4' },
-          { step: 2, action: 'walk', targetX: 12, targetZ: 7, duration: 3, description: 'Va a despacho', zone: 'z5' },
-          { step: 3, action: 'work', targetX: 12, targetZ: 7, duration: 3, description: 'Registra productos', zone: 'z5' },
-          { step: 4, action: 'walk', targetX: 10, targetZ: -5, duration: 3, description: 'Regresa a control', zone: 'z4' }
-        ]
-      }
+          { step: 1, action: 'inspect', targetX: 10, targetZ: -3, duration: 5, description: 'Inspección dimensional', zone: 'z4' },
+          { step: 2, action: 'carry', targetX: 6, targetZ: 7, duration: 3, description: 'Aprueba y envía a despacho', zone: 'z6' },
+          { step: 3, action: 'walk', targetX: 10, targetZ: -3, duration: 3, description: 'Regresa a QC', zone: 'z4' },
+        ] },
     ],
-    kpis: { cycleTime: 18, workersCount: 3, zonesCount: 5, efficiency: 76 },
-    steps: [
-      'Paso 1: Operario recoge materiales del almacén',
-      'Paso 2: Transporta materiales a Estación A',
-      'Paso 3: Ensambla componente (5 min)',
-      'Paso 4: Segundo operario procesa en Estación B',
-      'Paso 5: Inspector verifica calidad',
-      'Paso 6: Producto aprobado va a despacho'
-    ]
+    kpis: { cycleTime: 14, workersCount: 3, zonesCount: 6, machinesCount: 6, efficiency: 86, throughput: 264 },
+    steps: ['Recepción MP', 'Pre-ensamble', 'Ensamble principal', 'Control de calidad', 'Packaging', 'Despacho'],
+    bottlenecks: ['Cuello de botella en ensamble principal (mayor tiempo de ciclo)'],
+    improvements: ['Segundo robot de ensamble para incrementar throughput', 'Sistema de abastecimiento automático desde almacén']
   }),
 
-  warehouse: (p: string) => ({
-    title: 'Centro de Distribución Logístico',
-    description: p.substring(0, 80) + '...',
-    environment: { width: 40, depth: 28, floorColor: '#181e18', wallColor: '#1a3040', ambientColor: '#2a3a4a' },
+  logistics: () => ({
+    title: 'Centro de Distribución — Flujo Logístico',
+    description: 'Proceso de recepción, clasificación, almacenamiento y despacho de mercancías en centro de distribución.',
+    environment: { width: 40, depth: 26, floorColor: '#0a0a14', wallColor: '#141428', ceilingHeight: 8 },
     zones: [
-      { id: 'z1', name: 'Muelle Recepción', type: 'entry', x: -17, z: 0, width: 4, depth: 8, height: 0.1, color: '#1a2a3a', label: 'Muelle' },
-      { id: 'z2', name: 'Racks A', type: 'storage', x: -6, z: -8, width: 8, depth: 5, height: 0.1, color: '#1a3a1a', label: 'Racks A' },
-      { id: 'z3', name: 'Racks B', type: 'storage', x: 6, z: -8, width: 8, depth: 5, height: 0.1, color: '#1a3a1a', label: 'Racks B' },
-      { id: 'z4', name: 'Picking', type: 'workstation', x: 0, z: 4, width: 8, depth: 4, height: 0.1, color: '#2a2a1a', label: 'Picking' },
-      { id: 'z5', name: 'Empaque', type: 'assembly', x: 10, z: 4, width: 5, depth: 4, height: 0.1, color: '#1a1a3a', label: 'Empaque' },
-      { id: 'z6', name: 'Despacho', type: 'exit', x: 17, z: 0, width: 4, depth: 8, height: 0.1, color: '#2a1a1a', label: 'Despacho' }
+      { id: 'z1', name: 'Muelle Recepción', type: 'entry', x: -17, z: -9, width: 5, depth: 5, height: 0.08, color: '#1a2a3a', label: 'Recepción' },
+      { id: 'z2', name: 'Área Clasificación', type: 'workstation', x: -8, z: -5, width: 6, depth: 5, height: 0.08, color: '#1a3a2a', label: 'Clasificac.' },
+      { id: 'z3', name: 'Almacén A (Seco)', type: 'storage', x: 0, z: -6, width: 8, depth: 8, height: 0.08, color: '#2a1a3a', label: 'Almacén A' },
+      { id: 'z4', name: 'Almacén B (Frío)', type: 'storage', x: 10, z: -4, width: 6, depth: 6, height: 0.08, color: '#1a2a4a', label: 'Almacén B' },
+      { id: 'z5', name: 'Picking / Preparación', type: 'assembly', x: -4, z: 7, width: 7, depth: 5, height: 0.08, color: '#3a2a1a', label: 'Picking' },
+      { id: 'z6', name: 'Muelle Despacho', type: 'exit', x: 14, z: 8, width: 5, depth: 5, height: 0.08, color: '#3a1a2a', label: 'Despacho' },
+      { id: 'z7', name: 'Control Inventario', type: 'office', x: 16, z: -8, width: 4, depth: 3, height: 0.08, color: '#2a2a1a', label: 'Control' },
     ],
     machines: [
-      { id: 'm1', name: 'Estante Alto A', type: 'shelf', x: -7, z: -8, width: 6, depth: 0.5, height: 4, color: '#554422', animated: false },
-      { id: 'm2', name: 'Estante Alto B', type: 'shelf', x: 5, z: -8, width: 6, depth: 0.5, height: 4, color: '#554422', animated: false },
-      { id: 'm3', name: 'Mesa Picking', type: 'table', x: 0, z: 4, width: 3, depth: 1.5, height: 0.9, color: '#886633', animated: false },
-      { id: 'm4', name: 'Empacadora', type: 'conveyor', x: 10, z: 4, width: 4, depth: 0.8, height: 0.5, color: '#334455', animated: true },
-      { id: 'm5', name: 'Computer Gestión', type: 'computer', x: -15, z: 5, width: 0.5, depth: 0.4, height: 1.2, color: '#334455', animated: false }
+      { id: 'm1', name: 'Transportador Recepción', type: 'conveyor', x: -14, z: -7, width: 6, depth: 0.8, height: 0.9, color: '#4a5568', animated: true },
+      { id: 'm2', name: 'Escáner Entrada', type: 'scanner', x: -11, z: -9, width: 0.4, depth: 0.4, height: 1.8, color: '#334455', animated: false },
+      { id: 'm3', name: 'Carretilla Elevadora 1', type: 'crane', x: 0, z: -6, width: 1.2, depth: 2, height: 2.5, color: '#cc8822', animated: true },
+      { id: 'm4', name: 'Carretilla Elevadora 2', type: 'crane', x: 10, z: -4, width: 1.2, depth: 2, height: 2.5, color: '#cc6622', animated: false },
+      { id: 'm5', name: 'Sistema WMS', type: 'computer', x: 16, z: -8, width: 0.6, depth: 0.4, height: 1.5, color: '#334455', animated: false },
+      { id: 'm6', name: 'Sorter Clasificación', type: 'conveyor', x: -6, z: -3, width: 4, depth: 0.8, height: 1, color: '#445566', animated: true },
+      { id: 'm7', name: 'Estaciones Picking', type: 'table', x: -4, z: 7, width: 4, depth: 1.5, height: 0.9, color: '#664433', animated: false },
     ],
     workers: [
-      {
-        id: 'w1', name: 'Recepcionista', color: '#aa4433', startX: -17, startZ: 0,
+      { id: 'w1', name: 'Receptor', color: '#3b82f6', helmetColor: '#60a5fa', startX: -17, startZ: -9,
         route: [
-          { step: 1, action: 'work', targetX: -17, targetZ: 0, duration: 4, description: 'Recibe y escanea pallet', zone: 'z1' },
-          { step: 2, action: 'carry', targetX: -6, targetZ: -8, duration: 5, description: 'Lleva a racks A', zone: 'z2' },
-          { step: 3, action: 'work', targetX: -6, targetZ: -8, duration: 3, description: 'Almacena en rack', zone: 'z2' },
-          { step: 4, action: 'walk', targetX: -17, targetZ: 0, duration: 4, description: 'Regresa al muelle', zone: 'z1' }
-        ]
-      },
-      {
-        id: 'w2', name: 'Picker', color: '#3355aa', startX: 0, startZ: -8,
+          { step: 1, action: 'inspect', targetX: -17, targetZ: -9, duration: 4, description: 'Verifica y descarga mercancía', zone: 'z1' },
+          { step: 2, action: 'carry', targetX: -8, targetZ: -5, duration: 3, description: 'Lleva a clasificación', zone: 'z2' },
+          { step: 3, action: 'walk', targetX: -17, targetZ: -9, duration: 3, description: 'Regresa al muelle', zone: 'z1' },
+        ] },
+      { id: 'w2', name: 'Clasificador', color: '#10b981', helmetColor: '#34d399', startX: -8, startZ: -5,
         route: [
-          { step: 1, action: 'walk', targetX: -6, targetZ: -8, duration: 3, description: 'Va a Racks A', zone: 'z2' },
-          { step: 2, action: 'work', targetX: -6, targetZ: -8, duration: 3, description: 'Recoge producto', zone: 'z2' },
-          { step: 3, action: 'carry', targetX: 0, targetZ: 4, duration: 3, description: 'Lleva a Picking', zone: 'z4' },
-          { step: 4, action: 'carry', targetX: 10, targetZ: 4, duration: 3, description: 'Lleva a Empaque', zone: 'z5' },
-          { step: 5, action: 'walk', targetX: 0, targetZ: -8, duration: 4, description: 'Regresa a racks', zone: 'z2' }
-        ]
-      },
-      {
-        id: 'w3', name: 'Empacador', color: '#33aa55', startX: 10, startZ: 4,
+          { step: 1, action: 'work', targetX: -8, targetZ: -5, duration: 3, description: 'Clasifica y etiqueta', zone: 'z2' },
+          { step: 2, action: 'carry', targetX: 0, targetZ: -6, duration: 4, description: 'Almacena en zona seca', zone: 'z3' },
+          { step: 3, action: 'walk', targetX: -8, targetZ: -5, duration: 3, description: 'Regresa a clasificación', zone: 'z2' },
+        ] },
+      { id: 'w3', name: 'Operador Picking', color: '#f59e0b', helmetColor: '#fbbf24', startX: -4, startZ: 7,
         route: [
-          { step: 1, action: 'work', targetX: 10, targetZ: 4, duration: 5, description: 'Empaca pedido', zone: 'z5' },
-          { step: 2, action: 'carry', targetX: 17, targetZ: 0, duration: 3, description: 'Lleva a despacho', zone: 'z6' },
-          { step: 3, action: 'work', targetX: 17, targetZ: 0, duration: 2, description: 'Carga al camión', zone: 'z6' },
-          { step: 4, action: 'walk', targetX: 10, targetZ: 4, duration: 3, description: 'Regresa a empaque', zone: 'z5' }
-        ]
-      }
+          { step: 1, action: 'work', targetX: -4, targetZ: 7, duration: 5, description: 'Prepara pedido según WMS', zone: 'z5' },
+          { step: 2, action: 'carry', targetX: 14, targetZ: 8, duration: 3, description: 'Lleva pedido a despacho', zone: 'z6' },
+          { step: 3, action: 'walk', targetX: -4, targetZ: 7, duration: 3, description: 'Regresa a picking', zone: 'z5' },
+        ] },
     ],
-    kpis: { cycleTime: 14, workersCount: 3, zonesCount: 6, efficiency: 82 },
-    steps: [
-      'Paso 1: Recepción y escaneo de mercancía',
-      'Paso 2: Almacenamiento en racks',
-      'Paso 3: Picking según orden',
-      'Paso 4: Empaque del pedido',
-      'Paso 5: Despacho al camión'
-    ]
+    kpis: { cycleTime: 11, workersCount: 3, zonesCount: 7, machinesCount: 7, efficiency: 91, throughput: 480 },
+    steps: ['Recepción y verificación', 'Clasificación y etiquetado', 'Almacenamiento', 'Gestión WMS', 'Picking de pedidos', 'Despacho y carga'],
+    bottlenecks: ['Clasificación puede generar cola en recepción masiva'],
+    improvements: ['Sistema de clasificación automática (sorter)', 'Picking por voz para incrementar velocidad']
   }),
 
-  kitchen: (p: string) => ({
-    title: 'Cocina Industrial',
-    description: p.substring(0, 80) + '...',
-    environment: { width: 24, depth: 16, floorColor: '#1e1e1e', wallColor: '#2a2a1a', ambientColor: '#3a3a2a' },
+  food: () => ({
+    title: 'Cocina Industrial — Línea de Producción Alimentaria',
+    description: 'Proceso de preparación y ensamble de comidas en cocina industrial con control de temperatura y trazabilidad.',
+    environment: { width: 28, depth: 18, floorColor: '#141414', wallColor: '#202020', ceilingHeight: 4 },
     zones: [
-      { id: 'z1', name: 'Prep.', type: 'workstation', x: -9, z: -5, width: 5, depth: 4, height: 0.1, color: '#2a2a1a', label: 'Preparación' },
-      { id: 'z2', name: 'Cocción', type: 'workstation', x: 0, z: -2, width: 6, depth: 5, height: 0.1, color: '#3a1a1a', label: 'Cocción' },
-      { id: 'z3', name: 'Emplatado', type: 'assembly', x: 8, z: -4, width: 4, depth: 3, height: 0.1, color: '#1a2a1a', label: 'Emplatado' },
-      { id: 'z4', name: 'Servicio', type: 'exit', x: 10, z: 5, width: 3, depth: 3, height: 0.1, color: '#1a1a2a', label: 'Servicio' },
-      { id: 'z5', name: 'Lavado', type: 'storage', x: -8, z: 5, width: 5, depth: 3, height: 0.1, color: '#1a2a3a', label: 'Lavado' }
+      { id: 'z1', name: 'Recepción MP', type: 'entry', x: -11, z: -6, width: 4, depth: 3, height: 0.08, color: '#1a2a1a', label: 'Recepción' },
+      { id: 'z2', name: 'Prep. Fría', type: 'workstation', x: -5, z: -4, width: 4, depth: 3, height: 0.08, color: '#1a1a3a', label: 'Prep. Fría' },
+      { id: 'z3', name: 'Prep. Caliente', type: 'workstation', x: 2, z: -3, width: 4, depth: 4, height: 0.08, color: '#3a1a1a', label: 'Prep. Cal.' },
+      { id: 'z4', name: 'Cocción', type: 'assembly', x: 8, z: -2, width: 4, depth: 4, height: 0.08, color: '#2a2a1a', label: 'Cocción' },
+      { id: 'z5', name: 'Emplatado', type: 'workstation', x: -3, z: 5, width: 5, depth: 3, height: 0.08, color: '#1a3a2a', label: 'Emplatado' },
+      { id: 'z6', name: 'QC Temperatura', type: 'quality', x: 6, z: 6, width: 3, depth: 3, height: 0.08, color: '#3a2a1a', label: 'QC Temp' },
+      { id: 'z7', name: 'Entrega / Servicio', type: 'exit', x: 10, z: 6, width: 3, depth: 3, height: 0.08, color: '#2a1a3a', label: 'Entrega' },
     ],
     machines: [
-      { id: 'm1', name: 'Estufa industrial', type: 'oven', x: 0, z: -2, width: 2.5, depth: 1.5, height: 1.2, color: '#884433', animated: true },
-      { id: 'm2', name: 'Mesa prep.', type: 'table', x: -9, z: -5, width: 3, depth: 1.2, height: 0.9, color: '#888833', animated: false },
-      { id: 'm3', name: 'Mesa emplatado', type: 'table', x: 8, z: -4, width: 2, depth: 1, height: 0.9, color: '#888844', animated: false },
-      { id: 'm4', name: 'Fregadero', type: 'table', x: -8, z: 5, width: 2, depth: 1, height: 0.9, color: '#334455', animated: false }
+      { id: 'm1', name: 'Horno Convección ×2', type: 'oven', x: 8, z: -2, width: 1.5, depth: 1.2, height: 1.8, color: '#884422', animated: true },
+      { id: 'm2', name: 'Cocina Industrial', type: 'oven', x: 10, z: -1, width: 1.5, depth: 0.9, height: 1.2, color: '#664422', animated: true },
+      { id: 'm3', name: 'Mesa Prep. Fría', type: 'table', x: -5, z: -4, width: 3, depth: 1.5, height: 0.9, color: '#334455', animated: false },
+      { id: 'm4', name: 'Mesa Emplatado', type: 'table', x: -3, z: 5, width: 4, depth: 1.2, height: 0.9, color: '#445533', animated: false },
+      { id: 'm5', name: 'Termómetro Digital', type: 'scanner', x: 6, z: 6, width: 0.2, depth: 0.2, height: 0.5, color: '#334455', animated: false },
+      { id: 'm6', name: 'Refrigerador Industrial', type: 'shelf', x: -10, z: -4, width: 1.5, depth: 0.8, height: 2.2, color: '#2a4a6e', animated: false },
     ],
     workers: [
-      {
-        id: 'w1', name: 'Chef Prep.', color: '#aaaaaa', startX: -9, startZ: -5,
+      { id: 'w1', name: 'Chef de Partida', color: '#e5e7eb', helmetColor: '#ffffff', startX: 2, startZ: -3,
         route: [
-          { step: 1, action: 'work', targetX: -9, targetZ: -5, duration: 4, description: 'Prepara ingredientes', zone: 'z1' },
-          { step: 2, action: 'carry', targetX: 0, targetZ: -2, duration: 3, description: 'Pasa a cocción', zone: 'z2' },
-          { step: 3, action: 'walk', targetX: -9, targetZ: -5, duration: 3, description: 'Regresa a prep.', zone: 'z1' }
-        ]
-      },
-      {
-        id: 'w2', name: 'Chef Cocina', color: '#cccccc', startX: 0, startZ: -2,
+          { step: 1, action: 'work', targetX: 2, targetZ: -3, duration: 5, description: 'Prepara ingredientes calientes', zone: 'z3' },
+          { step: 2, action: 'carry', targetX: 8, targetZ: -2, duration: 2, description: 'Lleva a cocción', zone: 'z4' },
+          { step: 3, action: 'inspect', targetX: 8, targetZ: -2, duration: 3, description: 'Supervisa cocción', zone: 'z4' },
+          { step: 4, action: 'walk', targetX: 2, targetZ: -3, duration: 2, description: 'Regresa a prep.', zone: 'z3' },
+        ] },
+      { id: 'w2', name: 'Cocinero Frío', color: '#93c5fd', helmetColor: '#bfdbfe', startX: -5, startZ: -4,
         route: [
-          { step: 1, action: 'work', targetX: 0, targetZ: -2, duration: 7, description: 'Cocina platillo', zone: 'z2' },
-          { step: 2, action: 'carry', targetX: 8, targetZ: -4, duration: 2, description: 'Pasa a emplatado', zone: 'z3' },
-          { step: 3, action: 'walk', targetX: 0, targetZ: -2, duration: 2, description: 'Regresa a cocción', zone: 'z2' }
-        ]
-      },
-      {
-        id: 'w3', name: 'Chef Emplatado', color: '#ddddaa', startX: 8, startZ: -4,
+          { step: 1, action: 'work', targetX: -5, targetZ: -4, duration: 5, description: 'Prepara ingredientes fríos', zone: 'z2' },
+          { step: 2, action: 'carry', targetX: -3, targetZ: 5, duration: 2, description: 'Lleva a emplatado', zone: 'z5' },
+          { step: 3, action: 'walk', targetX: -5, targetZ: -4, duration: 2, description: 'Regresa a prep. fría', zone: 'z2' },
+        ] },
+      { id: 'w3', name: 'Emplatador', color: '#6ee7b7', helmetColor: '#a7f3d0', startX: -3, startZ: 5,
         route: [
-          { step: 1, action: 'work', targetX: 8, targetZ: -4, duration: 3, description: 'Emplata y decora', zone: 'z3' },
-          { step: 2, action: 'carry', targetX: 10, targetZ: 5, duration: 2, description: 'Lleva a servicio', zone: 'z4' },
-          { step: 3, action: 'walk', targetX: 8, targetZ: -4, duration: 2, description: 'Regresa a emplatado', zone: 'z3' }
-        ]
-      }
+          { step: 1, action: 'work', targetX: -3, targetZ: 5, duration: 3, description: 'Emplata y presenta', zone: 'z5' },
+          { step: 2, action: 'carry', targetX: 6, targetZ: 6, duration: 2, description: 'Lleva a control temperatura', zone: 'z6' },
+          { step: 3, action: 'carry', targetX: 10, targetZ: 6, duration: 1, description: 'Entrega al servicio', zone: 'z7' },
+          { step: 4, action: 'walk', targetX: -3, targetZ: 5, duration: 3, description: 'Regresa a emplatado', zone: 'z5' },
+        ] },
     ],
-    kpis: { cycleTime: 12, workersCount: 3, zonesCount: 5, efficiency: 84 },
-    steps: ['Paso 1: Preparación de ingredientes', 'Paso 2: Cocción del platillo', 'Paso 3: Emplatado y decoración', 'Paso 4: Servicio al cliente']
+    kpis: { cycleTime: 13, workersCount: 3, zonesCount: 7, machinesCount: 6, efficiency: 84, throughput: 277 },
+    steps: ['Recepción MP', 'Preparación fría', 'Preparación caliente', 'Cocción', 'Emplatado', 'QC y temperatura', 'Servicio'],
+    bottlenecks: ['Cuello de botella en cocción (mayor tiempo de proceso)'],
+    improvements: ['Horno adicional para ampliar capacidad', 'Mise en place estandarizado']
   }),
 
-  medical: (p: string) => ({
-    title: 'Laboratorio Clínico',
-    description: p.substring(0, 80) + '...',
-    environment: { width: 22, depth: 16, floorColor: '#eaeaea', wallColor: '#ccddee', ambientColor: '#ddeeff' },
+  medical: () => ({
+    title: 'Laboratorio Clínico — Procesamiento de Muestras',
+    description: 'Flujo de trabajo de laboratorio clínico con cadena de custodia, centrifugado, análisis automatizado y validación.',
+    environment: { width: 26, depth: 18, floorColor: '#e8e8ec', wallColor: '#d0dde8', ceilingHeight: 4 },
     zones: [
-      { id: 'z1', name: 'Recepción', type: 'entry', x: -9, z: -5, width: 3, depth: 3, height: 0.1, color: '#aaccdd', label: 'Recepción' },
-      { id: 'z2', name: 'Centrifugado', type: 'workstation', x: -3, z: -3, width: 4, depth: 3, height: 0.1, color: '#aaddcc', label: 'Centrifugado' },
-      { id: 'z3', name: 'Análisis', type: 'inspection', x: 4, z: -3, width: 5, depth: 4, height: 0.1, color: '#ccddaa', label: 'Análisis' },
-      { id: 'z4', name: 'Validación', type: 'office', x: 8, z: 5, width: 4, depth: 3, height: 0.1, color: '#ddccaa', label: 'Validación' },
-      { id: 'z5', name: 'Zona Estéril', type: 'workstation', x: -4, z: 5, width: 5, depth: 3, height: 0.1, color: '#eeddcc', label: 'Estéril' }
+      { id: 'z1', name: 'Recepción Muestras', type: 'entry', x: -10, z: -6, width: 4, depth: 3, height: 0.08, color: '#aaccdd', label: 'Recepción' },
+      { id: 'z2', name: 'Triaje y Registro', type: 'workstation', x: -4, z: -5, width: 4, depth: 3, height: 0.08, color: '#bbddcc', label: 'Triaje' },
+      { id: 'z3', name: 'Centrifugado', type: 'assembly', x: 2, z: -4, width: 4, depth: 4, height: 0.08, color: '#ccddaa', label: 'Centrifugado' },
+      { id: 'z4', name: 'Análisis Automatizado', type: 'inspection', x: 8, z: -3, width: 5, depth: 5, height: 0.08, color: '#ddccaa', label: 'Análisis' },
+      { id: 'z5', name: 'Zona Estéril', type: 'quality', x: -4, z: 5, width: 5, depth: 4, height: 0.08, color: '#eedddd', label: 'Estéril' },
+      { id: 'z6', name: 'Validación', type: 'office', x: 9, z: 6, width: 4, depth: 3, height: 0.08, color: '#ddccbb', label: 'Validación' },
+      { id: 'z7', name: 'Archivo', type: 'storage', x: -10, z: 5, width: 3, depth: 3, height: 0.08, color: '#ccbbaa', label: 'Archivo' },
     ],
     machines: [
-      { id: 'm1', name: 'Centrífuga', type: 'press', x: -3, z: -3, width: 1, depth: 1, height: 1.2, color: '#aaaacc', animated: true },
-      { id: 'm2', name: 'Analizador', type: 'computer', x: 4, z: -3, width: 1.2, depth: 0.8, height: 1.5, color: '#ccccaa', animated: false },
-      { id: 'm3', name: 'Microscopio', type: 'computer', x: 6, z: -3, width: 0.5, depth: 0.5, height: 1.2, color: '#aaccaa', animated: false },
-      { id: 'm4', name: 'PC Validación', type: 'computer', x: 8, z: 5, width: 0.5, depth: 0.4, height: 1.2, color: '#334455', animated: false }
+      { id: 'm1', name: 'Centrífuga ×2', type: 'press', x: 2, z: -4, width: 1.2, depth: 1.2, height: 1.2, color: '#aaaacc', animated: true },
+      { id: 'm2', name: 'Analizador Hematología', type: 'computer', x: 8, z: -3, width: 1.5, depth: 0.9, height: 1.6, color: '#ccccaa', animated: false },
+      { id: 'm3', name: 'Analizador Bioquímica', type: 'computer', x: 10, z: -3, width: 1.5, depth: 0.9, height: 1.6, color: '#aaccaa', animated: false },
+      { id: 'm4', name: 'PC Triaje', type: 'computer', x: -4, z: -5, width: 0.5, depth: 0.4, height: 1.2, color: '#334455', animated: false },
+      { id: 'm5', name: 'PC Validación', type: 'computer', x: 9, z: 6, width: 0.5, depth: 0.4, height: 1.2, color: '#334455', animated: false },
+      { id: 'm6', name: 'Lector Código Barras', type: 'scanner', x: -4, z: -6, width: 0.2, depth: 0.2, height: 1, color: '#334455', animated: false },
     ],
     workers: [
-      {
-        id: 'w1', name: 'Técnico Rec.', color: '#2266aa', startX: -9, startZ: -5,
+      { id: 'w1', name: 'TLM Recepción', color: '#2266aa', helmetColor: '#4488cc', startX: -10, startZ: -6,
         route: [
-          { step: 1, action: 'work', targetX: -9, targetZ: -5, duration: 3, description: 'Recibe muestra', zone: 'z1' },
-          { step: 2, action: 'carry', targetX: -3, targetZ: -3, duration: 3, description: 'Lleva a centrífuga', zone: 'z2' },
-          { step: 3, action: 'walk', targetX: -9, targetZ: -5, duration: 3, description: 'Regresa a recepción', zone: 'z1' }
-        ]
-      },
-      {
-        id: 'w2', name: 'Técnico Lab', color: '#2288cc', startX: -3, startZ: -3,
+          { step: 1, action: 'work', targetX: -10, targetZ: -6, duration: 3, description: 'Recibe muestra con cadena custodia', zone: 'z1' },
+          { step: 2, action: 'carry', targetX: -4, targetZ: -5, duration: 2, description: 'Lleva a triaje y registro', zone: 'z2' },
+          { step: 3, action: 'walk', targetX: -10, targetZ: -6, duration: 2, description: 'Regresa a recepción', zone: 'z1' },
+        ] },
+      { id: 'w2', name: 'TLM Análisis', color: '#2288cc', helmetColor: '#44aadd', startX: 2, startZ: -4,
         route: [
-          { step: 1, action: 'work', targetX: -3, targetZ: -3, duration: 5, description: 'Opera centrífuga', zone: 'z2' },
-          { step: 2, action: 'carry', targetX: 4, targetZ: -3, duration: 3, description: 'Lleva a análisis', zone: 'z3' },
-          { step: 3, action: 'inspect', targetX: 4, targetZ: -3, duration: 5, description: 'Realiza análisis', zone: 'z3' },
-          { step: 4, action: 'walk', targetX: -3, targetZ: -3, duration: 3, description: 'Regresa a centrífuga', zone: 'z2' }
-        ]
-      },
-      {
-        id: 'w3', name: 'Validador', color: '#22aa88', startX: 8, startZ: 5,
+          { step: 1, action: 'work', targetX: 2, targetZ: -4, duration: 5, description: 'Opera centrífuga', zone: 'z3' },
+          { step: 2, action: 'carry', targetX: 8, targetZ: -3, duration: 2, description: 'Carga analizadores', zone: 'z4' },
+          { step: 3, action: 'inspect', targetX: 8, targetZ: -3, duration: 5, description: 'Supervisa análisis', zone: 'z4' },
+          { step: 4, action: 'walk', targetX: 2, targetZ: -4, duration: 2, description: 'Regresa a centrífuga', zone: 'z3' },
+        ] },
+      { id: 'w3', name: 'Patólogo Validador', color: '#22aa88', helmetColor: '#44ccaa', startX: 9, startZ: 6,
         route: [
-          { step: 1, action: 'inspect', targetX: 8, targetZ: 5, duration: 5, description: 'Valida resultados', zone: 'z4' },
-          { step: 2, action: 'work', targetX: 8, targetZ: 5, duration: 3, description: 'Firma reporte', zone: 'z4' },
-          { step: 3, action: 'walk', targetX: 4, targetZ: -3, duration: 4, description: 'Verifica análisis', zone: 'z3' },
-          { step: 4, action: 'walk', targetX: 8, targetZ: 5, duration: 4, description: 'Regresa a validación', zone: 'z4' }
-        ]
-      }
+          { step: 1, action: 'inspect', targetX: 9, targetZ: 6, duration: 5, description: 'Valida resultados analíticos', zone: 'z6' },
+          { step: 2, action: 'work', targetX: 9, targetZ: 6, duration: 3, description: 'Libera reporte al sistema', zone: 'z6' },
+          { step: 3, action: 'walk', targetX: -10, targetZ: 5, duration: 5, description: 'Archiva documentación', zone: 'z7' },
+          { step: 4, action: 'walk', targetX: 9, targetZ: 6, duration: 5, description: 'Regresa a validación', zone: 'z6' },
+        ] },
     ],
-    kpis: { cycleTime: 16, workersCount: 3, zonesCount: 5, efficiency: 88 },
-    steps: ['Paso 1: Recepción y registro de muestra', 'Paso 2: Centrifugado', 'Paso 3: Análisis en analizador', 'Paso 4: Validación y reporte']
+    kpis: { cycleTime: 17, workersCount: 3, zonesCount: 7, machinesCount: 6, efficiency: 88, throughput: 212 },
+    steps: ['Recepción con cadena de custodia', 'Triaje y etiquetado', 'Centrifugado', 'Análisis automatizado', 'Validación patólogo', 'Liberación de resultados'],
+    bottlenecks: ['Cuello de botella en validación (único patólogo)'],
+    improvements: ['Segundo turno de validación', 'Reglas de autoliberación para valores normales']
   }),
 
-  maintenance: (p: string) => ({
-    title: 'Taller de Mantenimiento',
-    description: p.substring(0, 80) + '...',
-    environment: { width: 28, depth: 20, floorColor: '#1c1c1c', wallColor: '#2a2a2a', ambientColor: '#3a3a2a' },
+  maintenance: () => ({
+    title: 'Taller de Mantenimiento Industrial',
+    description: 'Procedimiento de mantenimiento preventivo y correctivo con diagnóstico, mecanizado, reparación y pruebas.',
+    environment: { width: 34, depth: 22, floorColor: '#1a1a1a', wallColor: '#282828', ceilingHeight: 7 },
     zones: [
-      { id: 'z1', name: 'Recepción Eq.', type: 'entry', x: -11, z: -7, width: 4, depth: 3, height: 0.1, color: '#2a2a1a', label: 'Recep. Eq.' },
-      { id: 'z2', name: 'Diagnóstico', type: 'inspection', x: -5, z: -4, width: 4, depth: 4, height: 0.1, color: '#1a2a2a', label: 'Diagnóstico' },
-      { id: 'z3', name: 'Reparación', type: 'workstation', x: 2, z: -2, width: 5, depth: 5, height: 0.1, color: '#1a1a2a', label: 'Reparación' },
-      { id: 'z4', name: 'Pruebas', type: 'inspection', x: 9, z: -4, width: 4, depth: 4, height: 0.1, color: '#2a1a1a', label: 'Pruebas' },
-      { id: 'z5', name: 'Almacén Repuestos', type: 'storage', x: -4, z: 7, width: 5, depth: 3, height: 0.1, color: '#1a3a1a', label: 'Repuestos' }
+      { id: 'z1', name: 'Recepción Equipos', type: 'entry', x: -14, z: -8, width: 4, depth: 4, height: 0.08, color: '#2a2a1a', label: 'Recepción' },
+      { id: 'z2', name: 'Diagnóstico', type: 'inspection', x: -7, z: -5, width: 5, depth: 4, height: 0.08, color: '#1a2a2a', label: 'Diagnóstico' },
+      { id: 'z3', name: 'Mecanizado', type: 'workstation', x: 0, z: -3, width: 6, depth: 6, height: 0.08, color: '#1a1a2a', label: 'Mecanizado' },
+      { id: 'z4', name: 'Soldadura', type: 'assembly', x: 8, z: -4, width: 4, depth: 4, height: 0.08, color: '#2a1a1a', label: 'Soldadura' },
+      { id: 'z5', name: 'Almacén Repuestos', type: 'storage', x: -6, z: 8, width: 5, depth: 3, height: 0.08, color: '#1a3a1a', label: 'Repuestos' },
+      { id: 'z6', name: 'Pruebas', type: 'quality', x: 12, z: -3, width: 4, depth: 4, height: 0.08, color: '#2a2a15', label: 'Pruebas' },
+      { id: 'z7', name: 'Entrega', type: 'exit', x: 14, z: 7, width: 4, depth: 3, height: 0.08, color: '#1a1a2a', label: 'Entrega' },
     ],
     machines: [
-      { id: 'm1', name: 'Torno CNC', type: 'lathe', x: 2, z: -2, width: 2.5, depth: 1.2, height: 1.5, color: '#556677', animated: true },
-      { id: 'm2', name: 'Fresadora', type: 'press', x: 4, z: 1, width: 1.5, depth: 1.5, height: 2, color: '#445566', animated: false },
-      { id: 'm3', name: 'Banco de Pruebas', type: 'table', x: 9, z: -4, width: 3, depth: 1.5, height: 1, color: '#664422', animated: false },
-      { id: 'm4', name: 'Estante Herr.', type: 'shelf', x: -11, z: 0, width: 3, depth: 0.5, height: 2.5, color: '#554422', animated: false },
-      { id: 'm5', name: 'Soldadora', type: 'robot', x: 0, z: 2, width: 0.8, depth: 0.8, height: 1.8, color: '#884422', animated: true }
+      { id: 'm1', name: 'Torno CNC', type: 'lathe', x: 0, z: -3, width: 2.5, depth: 1.5, height: 1.5, color: '#556677', animated: true },
+      { id: 'm2', name: 'Fresadora', type: 'cnc', x: 3, z: -1, width: 2, depth: 1.5, height: 2, color: '#445566', animated: false },
+      { id: 'm3', name: 'Soldadora MIG', type: 'welder', x: 8, z: -4, width: 0.8, depth: 0.8, height: 1.8, color: '#884422', animated: true },
+      { id: 'm4', name: 'Banco Diagnóstico', type: 'table', x: -7, z: -5, width: 3, depth: 1.5, height: 0.9, color: '#664422', animated: false },
+      { id: 'm5', name: 'Banco Pruebas', type: 'table', x: 12, z: -3, width: 3, depth: 1.5, height: 1, color: '#554422', animated: false },
+      { id: 'm6', name: 'Estante Herramientas', type: 'shelf', x: -14, z: -5, width: 3, depth: 0.5, height: 3, color: '#444422', animated: false },
+      { id: 'm7', name: 'Grúa Puente', type: 'crane', x: 0, z: 0, width: 1, depth: 1, height: 6, color: '#cc8822', animated: true },
     ],
     workers: [
-      {
-        id: 'w1', name: 'Técnico 1', color: '#cc7722', startX: -11, startZ: -7,
+      { id: 'w1', name: 'Técnico Recepción', color: '#cc7722', helmetColor: '#ffaa00', startX: -14, startZ: -8,
         route: [
-          { step: 1, action: 'work', targetX: -11, targetZ: -7, duration: 3, description: 'Recibe equipo', zone: 'z1' },
-          { step: 2, action: 'carry', targetX: -5, targetZ: -4, duration: 3, description: 'Lleva a diagnóstico', zone: 'z2' },
-          { step: 3, action: 'inspect', targetX: -5, targetZ: -4, duration: 5, description: 'Diagnóstico inicial', zone: 'z2' },
-          { step: 4, action: 'walk', targetX: -11, targetZ: -7, duration: 3, description: 'Regresa a recepción', zone: 'z1' }
-        ]
-      },
-      {
-        id: 'w2', name: 'Técnico 2', color: '#cc3322', startX: 2, startZ: -2,
+          { step: 1, action: 'inspect', targetX: -14, targetZ: -8, duration: 3, description: 'Recibe equipo y documenta', zone: 'z1' },
+          { step: 2, action: 'carry', targetX: -7, targetZ: -5, duration: 3, description: 'Lleva a diagnóstico', zone: 'z2' },
+          { step: 3, action: 'walk', targetX: -14, targetZ: -8, duration: 3, description: 'Regresa a recepción', zone: 'z1' },
+        ] },
+      { id: 'w2', name: 'Mecánico CNC', color: '#bb4411', helmetColor: '#ff6622', startX: 0, startZ: -3,
         route: [
-          { step: 1, action: 'work', targetX: 2, targetZ: -2, duration: 8, description: 'Desmonta componentes', zone: 'z3' },
-          { step: 2, action: 'repair', targetX: 2, targetZ: -2, duration: 6, description: 'Repara / mecaniza', zone: 'z3' },
-          { step: 3, action: 'carry', targetX: 9, targetZ: -4, duration: 3, description: 'Lleva a pruebas', zone: 'z4' },
-          { step: 4, action: 'walk', targetX: 2, targetZ: -2, duration: 3, description: 'Regresa al taller', zone: 'z3' }
-        ]
-      },
-      {
-        id: 'w3', name: 'Técnico 3', color: '#2255cc', startX: 9, startZ: -4,
+          { step: 1, action: 'repair', targetX: 0, targetZ: -3, duration: 10, description: 'Mecaniza y rectifica pieza', zone: 'z3' },
+          { step: 2, action: 'inspect', targetX: 0, targetZ: -3, duration: 2, description: 'Control dimensional', zone: 'z3' },
+          { step: 3, action: 'carry', targetX: 8, targetZ: -4, duration: 3, description: 'Lleva a soldadura', zone: 'z4' },
+          { step: 4, action: 'walk', targetX: 0, targetZ: -3, duration: 3, description: 'Regresa al CNC', zone: 'z3' },
+        ] },
+      { id: 'w3', name: 'Soldador Certificado', color: '#884422', helmetColor: '#cc6600', startX: 8, startZ: -4,
         route: [
-          { step: 1, action: 'inspect', targetX: 9, targetZ: -4, duration: 6, description: 'Pruebas finales', zone: 'z4' },
-          { step: 2, action: 'work', targetX: 9, targetZ: -4, duration: 3, description: 'Firma reporte', zone: 'z4' },
-          { step: 3, action: 'walk', targetX: -4, targetZ: 7, duration: 4, description: 'Recoge repuestos', zone: 'z5' },
-          { step: 4, action: 'walk', targetX: 9, targetZ: -4, duration: 4, description: 'Regresa a pruebas', zone: 'z4' }
-        ]
-      }
+          { step: 1, action: 'repair', targetX: 8, targetZ: -4, duration: 8, description: 'Soldadura y resane', zone: 'z4' },
+          { step: 2, action: 'carry', targetX: 12, targetZ: -3, duration: 3, description: 'Lleva a banco de pruebas', zone: 'z6' },
+          { step: 3, action: 'inspect', targetX: 12, targetZ: -3, duration: 4, description: 'Pruebas funcionales', zone: 'z6' },
+          { step: 4, action: 'walk', targetX: 8, targetZ: -4, duration: 5, description: 'Regresa a soldadura', zone: 'z4' },
+        ] },
     ],
-    kpis: { cycleTime: 24, workersCount: 3, zonesCount: 5, efficiency: 71 },
-    steps: ['Paso 1: Recepción y diagnóstico del equipo', 'Paso 2: Desmontaje de componentes', 'Paso 3: Reparación y mecanizado', 'Paso 4: Pruebas finales y liberación']
+    kpis: { cycleTime: 28, workersCount: 3, zonesCount: 7, machinesCount: 7, efficiency: 73, throughput: 129 },
+    steps: ['Recepción y documentación', 'Diagnóstico técnico', 'Búsqueda de repuestos', 'Mecanizado/rectificado', 'Soldadura', 'Pruebas funcionales', 'Entrega y cierre OT'],
+    bottlenecks: ['Cuello de botella en mecanizado CNC'],
+    improvements: ['Inventario mínimo de repuestos críticos', 'Segunda máquina CNC para piezas simples']
+  }),
+
+  construction: () => ({
+    title: 'Obra Civil — Gestión de Cuadrillas',
+    description: 'Coordinación de cuadrillas en obra: estructura, acabados, instalaciones y control de avance.',
+    environment: { width: 40, depth: 28, floorColor: '#2a2218', wallColor: '#1a1a18', ceilingHeight: 8 },
+    zones: [
+      { id: 'z1', name: 'Acopio Materiales', type: 'storage', x: -17, z: -10, width: 5, depth: 4, height: 0.08, color: '#2a2010', label: 'Acopio' },
+      { id: 'z2', name: 'Estructura', type: 'workstation', x: -7, z: -4, width: 6, depth: 6, height: 0.08, color: '#2a1a10', label: 'Estructura' },
+      { id: 'z3', name: 'Instalaciones', type: 'assembly', x: 3, z: -4, width: 6, depth: 6, height: 0.08, color: '#101a2a', label: 'Instalac.' },
+      { id: 'z4', name: 'Acabados', type: 'workstation', x: 12, z: -3, width: 5, depth: 5, height: 0.08, color: '#1a2010', label: 'Acabados' },
+      { id: 'z5', name: 'Supervisión', type: 'office', x: 0, z: 9, width: 5, depth: 3, height: 0.08, color: '#1a1a10', label: 'Supervisor' },
+      { id: 'z6', name: 'Seguridad', type: 'quality', x: -15, z: 8, width: 4, depth: 3, height: 0.08, color: '#251510', label: 'Seguridad' },
+      { id: 'z7', name: 'Salida', type: 'exit', x: 17, z: 8, width: 4, depth: 4, height: 0.08, color: '#151520', label: 'Salida' },
+    ],
+    machines: [
+      { id: 'm1', name: 'Concretera', type: 'press', x: -7, z: -4, width: 1.5, depth: 1.5, height: 1.5, color: '#888855', animated: true },
+      { id: 'm2', name: 'Andamio', type: 'shelf', x: 3, z: -4, width: 5, depth: 0.5, height: 4, color: '#777755', animated: false },
+      { id: 'm3', name: 'Mezcladora', type: 'press', x: -16, z: -8, width: 1.5, depth: 1.2, height: 1.2, color: '#886644', animated: true },
+      { id: 'm4', name: 'Compresor', type: 'oven', x: -13, z: -8, width: 1.2, depth: 0.8, height: 1, color: '#664422', animated: false },
+      { id: 'm5', name: 'Grúa Torre', type: 'crane', x: 0, z: -2, width: 1, depth: 1, height: 7, color: '#cc8822', animated: true },
+      { id: 'm6', name: 'Cortadora Cerámica', type: 'lathe', x: 12, z: -3, width: 1.5, depth: 0.8, height: 1, color: '#555544', animated: false },
+    ],
+    workers: [
+      { id: 'w1', name: 'Maestro de Obra', color: '#cc8822', helmetColor: '#ffffff', startX: 0, startZ: 9,
+        route: [
+          { step: 1, action: 'inspect', targetX: -7, targetZ: -4, duration: 4, description: 'Supervisa estructura', zone: 'z2' },
+          { step: 2, action: 'inspect', targetX: 3, targetZ: -4, duration: 3, description: 'Revisa instalaciones', zone: 'z3' },
+          { step: 3, action: 'work', targetX: 0, targetZ: 9, duration: 3, description: 'Registra avance', zone: 'z5' },
+        ] },
+      { id: 'w2', name: 'Cuadrilla Estructuras', color: '#886622', helmetColor: '#ffaa00', startX: -7, startZ: -4,
+        route: [
+          { step: 1, action: 'work', targetX: -7, targetZ: -4, duration: 8, description: 'Arma encofrado y vierte concreto', zone: 'z2' },
+          { step: 2, action: 'walk', targetX: -17, targetZ: -10, duration: 4, description: 'Busca materiales', zone: 'z1' },
+          { step: 3, action: 'carry', targetX: -7, targetZ: -4, duration: 4, description: 'Regresa con materiales', zone: 'z2' },
+        ] },
+      { id: 'w3', name: 'Cuadrilla Acabados', color: '#228833', helmetColor: '#44cc55', startX: 12, startZ: -3,
+        route: [
+          { step: 1, action: 'work', targetX: 12, targetZ: -3, duration: 7, description: 'Cerámica y pintura', zone: 'z4' },
+          { step: 2, action: 'walk', targetX: -17, targetZ: -10, duration: 5, description: 'Busca materiales', zone: 'z1' },
+          { step: 3, action: 'carry', targetX: 12, targetZ: -3, duration: 5, description: 'Regresa con materiales', zone: 'z4' },
+        ] },
+    ],
+    kpis: { cycleTime: 24, workersCount: 3, zonesCount: 7, machinesCount: 6, efficiency: 76, throughput: 150 },
+    steps: ['Revisión de planos', 'Acopio de materiales', 'Estructura', 'Instalaciones', 'Acabados', 'Inspección', 'Entrega'],
+    bottlenecks: ['Cuello de botella en instalaciones', 'Esperas por materiales'],
+    improvements: ['Plan de materiales semanal', 'Paralelizar instalaciones y acabados']
   })
 }
 
-// ─── Static files ──────────────────────────────────────────────────────────
-app.use('/static/*', serveStatic({ root: './public' }))
+// ═══════════════════════════════════════════════════════════════════════════
+// STATIC ASSETS + MAIN PAGE
+// ═══════════════════════════════════════════════════════════════════════════
 
-// ─── Main page ─────────────────────────────────────────────────────────────
-app.get('/', (c) => {
+app.use('/static/*', serveStatic({ root: './public' }))
+app.use('/assets/*', serveStatic({ root: './public' }))
+
+app.get('*', (c) => {
   return c.html(`<!DOCTYPE html>
 <html lang="es">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>SimPro3D — Generador de Simulaciones Industriales con IA</title>
+  <title>NexusForge — Industrial Simulation Platform</title>
+  <meta name="description" content="Plataforma profesional de simulación industrial 3D con IA. Genera, analiza y optimiza procesos de trabajo automáticamente desde descripción de procedimientos y planos.">
+  <meta property="og:title" content="NexusForge — Industrial Simulation Platform">
+  <meta property="og:description" content="Genera simulaciones 3D industriales con IA en segundos. Sin código, sin límites.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <script src="https://cdn.tailwindcss.com"></script>
-  <script src="https://cdn.jsdelivr.net/npm/three@0.161.0/build/three.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/three@0.161.0/examples/js/controls/OrbitControls.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.134.0/build/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.134.0/examples/js/controls/OrbitControls.js"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
   <link rel="stylesheet" href="/static/styles.css">
 </head>
-<body class="bg-gray-950 text-gray-100 min-h-screen">
-  <div id="app"></div>
+<body>
+  <div id="root"></div>
   <script src="/static/app.js"></script>
 </body>
 </html>`)

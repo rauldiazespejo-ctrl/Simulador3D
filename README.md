@@ -1,103 +1,86 @@
-# SimPro3D v4.0 — Generador de Simulaciones Industriales con IA
+# NexusForge — Industrial Simulation Platform
 
-Webapp que convierte la descripción de cualquier procedimiento o metodología de trabajo en una **simulación 3D animada interactiva** generada automáticamente con IA.
+## 🚀 Descripción
+**NexusForge** es una plataforma profesional de simulación industrial 3D con IA. Genera automáticamente simulaciones 3D con trabajadores animados, máquinas, zonas de trabajo y KPIs en tiempo real a partir de la descripción de un procedimiento de trabajo o la carga de un plano.
 
-## 🌐 Demo en vivo
-> Desplegado en Cloudflare Pages
+## 🌐 URL
+- **Live**: [https://nexusforge.pages.dev](https://nexusforge.pages.dev)
+- **GitHub**: [https://github.com/rauldiazespejo-ctrl/Simulador3D](https://github.com/rauldiazespejo-ctrl/Simulador3D)
 
-## ✨ Funcionalidades
+## ✨ Características
+- **Generación con IA**: Describe un procedimiento y NexusForge genera la escena 3D completa
+- **Análisis de planos**: Sube un croquis/plano y la IA recrea el espacio en 3D
+- **Trabajadores animados**: Hasta 4 operarios con rutas, acciones y estados visuales (caminar, trabajar, inspeccionar, reparar)
+- **Máquinas 3D**: Tornos, CNC, transportadores, prensas, hornos, grúas y más
+- **KPIs en tiempo real**: OEE, Throughput, Tiempo de ciclo, Utilización
+- **Panel de análisis**: Pasos del proceso, cuellos de botella, mejoras sugeridas
+- **Cámara orbital**: 5 vistas preestablecidas (isométrica, planta, frontal, lateral, aérea)
+- **Exportación**: JSON de escena e informe completo de KPIs
+- **Gestión de proyectos**: Múltiples proyectos con historial de simulaciones
+- **6 industrias**: Manufactura, Logística, Alimentos, Salud, Mantenimiento, Construcción
 
-### Entrada inteligente
-- 📝 Descripción libre del procedimiento de trabajo
-- 🗺️ Carga de plano o croquis (PNG/JPG/PDF) — la IA lo analiza para recrear el escenario
-- 🤖 Generación automática con GPT-5 (o modo demo sin API key)
+## 🏗️ Arquitectura
+```
+webapp/
+├── src/index.tsx          # Backend Hono (API REST + serve HTML)
+├── public/static/
+│   ├── app.js             # Frontend Three.js + UI completa
+│   ├── styles.css         # Design system NexusForge
+│   └── nexusforge-logo.png
+├── migrations/
+│   └── 0001_nexusforge_schema.sql   # D1 SQLite schema
+├── wrangler.jsonc         # Cloudflare Pages config
+└── ecosystem.config.cjs   # PM2 config (desarrollo)
+```
 
-### Motor 3D Three.js interactivo
-- Fábrica completa con zonas, máquinas y operarios
-- Humanoides articulados con 6 animaciones: walk, work, carry, inspect, repair, idle
-- Cámara orbital libre + 3 vistas preestablecidas (Planta / Isométrica / Frontal)
-- Pausar / Reiniciar la simulación
+## 📊 Data Architecture
+- **Cloudflare D1**: projects, simulations, simulation_runs
+- **Backend**: Hono (TypeScript) en Cloudflare Pages Functions
+- **Frontend**: Three.js r134 + vanilla JS (sin frameworks pesados)
+- **IA**: GenSpark LLM Proxy / OpenAI GPT-4o para generación de escenas
 
-### Panel KPI en tiempo real
-- OEE · Throughput · Utilización por operario
-- Tiempo de ciclo · Log de eventos
+## 🔑 APIs
+| Endpoint | Método | Descripción |
+|---|---|---|
+| `/api/generate` | POST | Genera escena 3D desde procedimiento (IA + fallback) |
+| `/api/projects` | GET/POST | CRUD proyectos |
+| `/api/projects/:id/simulations` | GET | Historial de simulaciones |
+| `/api/simulations/:id` | GET/DELETE | Operaciones sobre simulación |
+| `/api/simulations/:id/runs` | POST | Guardar ejecución con KPIs |
+| `/api/stats` | GET | Estadísticas globales |
 
-### 5 escenas demo inteligentes
-Detecta el tipo de procedimiento automáticamente:
-- 🏭 Ensamblaje industrial
-- 📦 Logística / Centro de distribución
-- 🍕 Cocina industrial
-- 🏥 Laboratorio clínico
-- ⚙️ Taller de mantenimiento
-
-### Exportación
-- JSON de la configuración de escena
-
-## 🛠️ Stack Técnico
-
-| Capa | Tecnología |
-|------|-----------|
-| Backend | Hono + Cloudflare Workers |
-| Frontend | Vanilla JS + Three.js r161 + Tailwind CSS |
-| IA | OpenAI GPT-5 (compatible GenSpark) |
-| Deploy | Cloudflare Pages |
-| Build | Vite + @hono/vite-build |
-
-## 🚀 Desarrollo local
-
-### Requisitos
-- Node.js 18+
-- npm
-
-### Instalación
+## 🚀 Instalación Local
 ```bash
 git clone https://github.com/rauldiazespejo-ctrl/Simulador3D.git
 cd Simulador3D
 npm install
+cp .dev.vars.example .dev.vars   # Edita con tu API key
+npx wrangler d1 migrations apply nexusforge-production --local
+npm run build
+pm2 start ecosystem.config.cjs
 ```
 
-### Configurar API Key (opcional para IA completa)
-```bash
-cp .dev.vars.example .dev.vars
-# Edita .dev.vars con tu API key de GenSpark
-```
-
-`.dev.vars.example`:
-```
-OPENAI_API_KEY=tu-api-key-aqui
-OPENAI_BASE_URL=https://www.genspark.ai/api/llm_proxy/v1
-```
-
-### Ejecutar en desarrollo
+## 🌐 Deploy a Cloudflare Pages
 ```bash
 npm run build
-npm run dev:sandbox
-# Abre http://localhost:3000
+npx wrangler pages deploy dist --project-name nexusforge
 ```
 
-## 📁 Estructura del proyecto
+## 🔧 Tech Stack
+- **Runtime**: Cloudflare Pages + Hono Framework
+- **Database**: Cloudflare D1 (SQLite edge)
+- **3D Engine**: Three.js r134
+- **Styling**: Tailwind CSS (CDN) + Custom CSS
+- **Icons**: FontAwesome 6.5
+- **IA**: GenSpark LLM / OpenAI GPT-4o
 
-```
-webapp/
-├── src/
-│   └── index.tsx          # Backend Hono (API + SSR)
-├── public/
-│   └── static/
-│       ├── app.js         # Motor 3D Three.js + UI
-│       └── styles.css     # Estilos profesionales
-├── wrangler.jsonc          # Configuración Cloudflare
-├── vite.config.ts          # Build config
-├── ecosystem.config.cjs    # PM2 config
-└── package.json
-```
+## 📅 Estado
+- ✅ Backend Hono + D1 operativo
+- ✅ Motor 3D completo (zonas, máquinas, trabajadores animados)
+- ✅ Generación con IA (texto + imagen de plano)
+- ✅ KPIs en tiempo real
+- ✅ Gestión de proyectos
+- ✅ 6 plantillas de industria predefinidas
+- ⏳ Deploy Cloudflare (requiere API key configurada)
 
-## 🎮 Uso
-
-1. Describe el procedimiento de trabajo en el área de texto
-2. (Opcional) Sube un plano o croquis
-3. Haz clic en "Generar Simulación con IA"
-4. Explora la simulación 3D con los controles de cámara
-5. Usa "Refinar" para modificar la escena con instrucciones en lenguaje natural
-
-## 📄 Licencia
-MIT
+**Última actualización**: 2026-03-20
