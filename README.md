@@ -3,67 +3,69 @@
 
 ---
 
+## 🌐 URLs de Producción
+
+| Entorno | URL |
+|---|---|
+| **Producción** | https://nexusforge-vercel.vercel.app |
+| **Dashboard Vercel** | https://vercel.com/rauldiazespejo-ctrls-projects/nexusforge-vercel |
+| **GitHub (rama vercel)** | https://github.com/rauldiazespejo-ctrl/Simulador3D/tree/vercel |
+
+---
+
 ## 📋 Estado del proyecto
 
 | Componente | Estado |
 |---|---|
-| Frontend (Three.js SPA) | ✅ Completo |
-| API Routes (Next.js) | ✅ Completo |
-| Supabase Client | ✅ Completo |
-| Vercel Config | ✅ Listo para deploy |
-| Supabase DB | ⚠️ Requiere configuración manual |
-| Vercel Deploy | ⚠️ Requiere token de Vercel |
+| Frontend Three.js SPA | ✅ Live en producción |
+| Next.js API Routes (10 endpoints) | ✅ Live en producción |
+| Supabase Client tipado | ✅ Listo |
+| Vercel Deploy | ✅ **Activo** |
+| Supabase DB | ⚠️ Requiere configuración (ver abajo) |
 
 ---
 
-## 🚀 Guía de despliegue (5 pasos)
+## 🗄️ Conectar Supabase (1 vez — 5 minutos)
 
-### Paso 1 — Crear proyecto Supabase
+> Sin Supabase, la app funciona con fallback procedimental (sin persistencia)
 
-1. Ve a **https://app.supabase.com** → New Project
-2. Nombre: `nexusforge`, región: la más cercana
-3. Una vez creado, ve a **SQL Editor → New Query**
-4. Pega y ejecuta el contenido de [`supabase-schema.sql`](./supabase-schema.sql)
-5. Ve a **Settings → API** y copia:
-   - `Project URL` → `NEXT_PUBLIC_SUPABASE_URL`
-   - `anon public` key → `NEXT_PUBLIC_SUPABASE_ANON_KEY`
-   - `service_role` key → `SUPABASE_SERVICE_ROLE_KEY`
+### 1 — Crear proyecto Supabase
+1. Ve a **https://app.supabase.com** → **New project** → nombre: `nexusforge`
+2. Espera ~2 min a que el proyecto esté listo
 
-### Paso 2 — Crear proyecto Vercel
+### 2 — Ejecutar schema SQL
+1. Ve a **SQL Editor → New Query**
+2. Pega el contenido de [`supabase-schema.sql`](./supabase-schema.sql) y ejecuta
 
-1. Ve a **https://vercel.com** → Add New → Project
-2. Importa el repo: `rauldiazespejo-ctrl/Simulador3D`
-3. **Root Directory**: `nexusforge-vercel` (o la carpeta del proyecto)
-4. **Branch**: `vercel`
-5. Framework: **Next.js** (auto-detectado)
+### 3 — Obtener credenciales
+Ve a **Settings → API** y copia:
+- `Project URL` → `NEXT_PUBLIC_SUPABASE_URL`
+- `anon public` key → `NEXT_PUBLIC_SUPABASE_ANON_KEY`
+- `service_role` key → `SUPABASE_SERVICE_ROLE_KEY`
 
-### Paso 3 — Configurar variables de entorno en Vercel
+### 4 — Actualizar variables en Vercel
 
-En el panel de Vercel → Settings → Environment Variables, añade:
+**Opción A — Dashboard Vercel:**
+1. Ve a https://vercel.com/rauldiazespejo-ctrls-projects/nexusforge-vercel/settings/environment-variables
+2. Edita `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`
+3. Haz un nuevo deploy (Settings → Deployments → Redeploy)
 
-```
-NEXT_PUBLIC_SUPABASE_URL        = https://xxxx.supabase.co
-NEXT_PUBLIC_SUPABASE_ANON_KEY   = eyJ...
-SUPABASE_SERVICE_ROLE_KEY       = eyJ...
-OPENAI_API_KEY                  = (opcional) tu API key de OpenAI
-OPENAI_BASE_URL                 = https://www.genspark.ai/api/llm_proxy/v1
-```
-
-### Paso 4 — Desplegar
-
-Vercel desplegará automáticamente al hacer push a la rama `vercel`.
-
-O manualmente con Vercel CLI:
+**Opción B — CLI:**
 ```bash
-export VERCEL_TOKEN=tu_token
-cd nexusforge-vercel
-/home/user/.npm-global/bin/vercel --token $VERCEL_TOKEN --yes
+VTOKEN="tu_vercel_personal_access_token"
+VCLI="vercel"
+
+printf "https://xxxx.supabase.co"  | $VCLI env rm NEXT_PUBLIC_SUPABASE_URL production -y --token "$VTOKEN"
+printf "https://xxxx.supabase.co"  | $VCLI env add NEXT_PUBLIC_SUPABASE_URL production --token "$VTOKEN" --yes
+
+printf "eyJ..."  | $VCLI env rm NEXT_PUBLIC_SUPABASE_ANON_KEY production -y --token "$VTOKEN"
+printf "eyJ..."  | $VCLI env add NEXT_PUBLIC_SUPABASE_ANON_KEY production --token "$VTOKEN" --yes
+
+printf "eyJ..."  | $VCLI env rm SUPABASE_SERVICE_ROLE_KEY production -y --token "$VTOKEN"
+printf "eyJ..."  | $VCLI env add SUPABASE_SERVICE_ROLE_KEY production --token "$VTOKEN" --yes
+
+$VCLI deploy --token "$VTOKEN" --prod --yes
 ```
-
-### Paso 5 — URL de producción
-
-Tras el deploy, recibirás:
-- `https://nexusforge-vercel.vercel.app` (o el nombre que elija Vercel)
 
 ---
 
@@ -72,71 +74,27 @@ Tras el deploy, recibirás:
 ```
 nexusforge-vercel/
 ├── app/
-│   ├── layout.tsx              # HTML shell con meta tags
-│   ├── page.tsx                # Sirve la SPA (Three.js cargado por scripts)
+│   ├── layout.tsx                        # Meta tags SEO + HTML shell
+│   ├── page.tsx                          # Sirve la SPA Three.js (static)
 │   └── api/
-│       ├── projects/
-│       │   ├── route.ts        # GET /api/projects, POST /api/projects
-│       │   └── [id]/
-│       │       ├── route.ts    # PUT, DELETE /api/projects/:id
-│       │       └── simulations/route.ts  # GET simulaciones del proyecto
-│       ├── simulations/
-│       │   ├── route.ts        # POST /api/simulations
-│       │   └── [id]/
-│       │       ├── route.ts    # GET, DELETE /api/simulations/:id
-│       │       └── runs/route.ts  # POST runs
-│       ├── generate/
-│       │   └── route.ts        # POST /api/generate (IA + fallback)
-│       └── stats/
-│           └── route.ts        # GET /api/stats
+│       ├── projects/route.ts             # GET + POST /api/projects
+│       ├── projects/[id]/route.ts        # PUT + DELETE
+│       ├── projects/[id]/simulations/    # GET simulaciones del proyecto
+│       ├── simulations/route.ts          # POST /api/simulations
+│       ├── simulations/[id]/route.ts     # GET + DELETE
+│       ├── simulations/[id]/runs/        # POST runs KPI
+│       ├── generate/route.ts             # POST IA + 6 templates fallback
+│       └── stats/route.ts               # GET estadísticas globales
 ├── lib/
-│   └── supabase.ts             # Cliente Supabase con tipos TypeScript
-├── public/
-│   └── static/
-│       ├── app.js              # SPA Three.js completa (~85KB)
-│       ├── styles.css          # Design system NexusForge (~35KB)
-│       └── nexusforge-logo.png
-├── supabase-schema.sql         # Schema PostgreSQL para Supabase
-└── vercel.json                 # Config de deployment
+│   └── supabase.ts                       # Cliente PostgreSQL tipado
+├── public/static/
+│   ├── app.js                           # Three.js SPA (~85KB)
+│   ├── styles.css                       # Design system NexusForge (~35KB)
+│   └── nexusforge-logo.png
+├── supabase-schema.sql                  # Schema listo para SQL Editor
+├── vercel.json                          # Config framework + region
+└── next.config.ts                       # ignoreBuildErrors
 ```
-
-## 🗄️ Modelos de datos (Supabase PostgreSQL)
-
-### projects
-| Campo | Tipo | Descripción |
-|---|---|---|
-| id | TEXT PK | UUID 16 chars |
-| name | TEXT | Nombre del proyecto |
-| description | TEXT | Descripción |
-| industry | TEXT | manufacturing/logistics/food/medical/maintenance/construction |
-| status | TEXT | active/archived |
-| created_at | TIMESTAMPTZ | Auto |
-| updated_at | TIMESTAMPTZ | Auto (trigger) |
-
-### simulations
-| Campo | Tipo | Descripción |
-|---|---|---|
-| id | TEXT PK | UUID 16 chars |
-| project_id | TEXT FK | Referencia a projects |
-| name | TEXT | Título de la simulación |
-| procedure | TEXT | Descripción del proceso |
-| scene_json | TEXT | JSON de la escena 3D |
-| workers_count | INTEGER | Número de trabajadores |
-| zones_count | INTEGER | Número de zonas |
-| efficiency | NUMERIC | % eficiencia (0-100) |
-| cycle_time | NUMERIC | Tiempo de ciclo en segundos |
-
-### simulation_runs
-| Campo | Tipo | Descripción |
-|---|---|---|
-| id | TEXT PK | UUID 16 chars |
-| simulation_id | TEXT FK | Referencia a simulations |
-| duration_sec | NUMERIC | Duración de la simulación |
-| oee | NUMERIC | Overall Equipment Effectiveness |
-| throughput | NUMERIC | Unidades por hora |
-| units_produced | INTEGER | Unidades producidas |
-| failures | INTEGER | Fallos detectados |
-| kpi_json | TEXT | KPIs completos en JSON |
 
 ## 🔌 API Endpoints
 
@@ -147,31 +105,27 @@ nexusforge-vercel/
 | PUT | /api/projects/:id | Actualizar proyecto |
 | DELETE | /api/projects/:id | Archivar proyecto |
 | GET | /api/projects/:id/simulations | Simulaciones del proyecto |
+| POST | /api/simulations | Guardar simulación |
 | GET | /api/simulations/:id | Obtener simulación |
 | DELETE | /api/simulations/:id | Eliminar simulación |
-| POST | /api/simulations/:id/runs | Guardar run de simulación |
-| POST | /api/generate | Generar escena 3D con IA |
+| POST | /api/simulations/:id/runs | Guardar run de KPIs |
+| POST | /api/generate | **Generar escena 3D con IA** |
 | GET | /api/stats | Estadísticas globales |
 
 ## 🤖 Generación con IA
 
-`POST /api/generate` acepta:
+`POST /api/generate`:
 ```json
 {
-  "procedure": "Descripción del proceso industrial",
+  "procedure": "Descripción del proceso",
   "industry": "manufacturing",
   "projectId": "abc123",
   "apiKey": "sk-..." 
 }
 ```
-
-- **Con API Key**: Usa GPT-4o via proxy de Genspark
-- **Sin API Key**: Fallback a 6 templates procedimentales (manufacturing, logistics, food, medical, maintenance, construction)
+- **Con API Key** → GPT-4o via proxy Genspark
+- **Sin API Key** → 6 templates: manufacturing / logistics / food / medical / maintenance / construction
 
 ---
 
-## 📝 Última actualización
-
-**Fecha**: 2026-03-20  
-**Versión**: 3.0 Vercel+Supabase  
-**GitHub**: https://github.com/rauldiazespejo-ctrl/Simulador3D (rama `vercel`)
+**Última actualización**: 2026-03-20 | **Versión**: 3.0 Vercel+Supabase | **Estado**: ✅ Live
