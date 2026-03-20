@@ -1,0 +1,14 @@
+{
+  "version": 2,
+  "buildCommand": "npm run build",
+  "outputDirectory": ".next",
+  "framework": "nextjs",
+  "regions": ["iad1"],
+  "env": {
+    "NEXT_PUBLIC_SUPABASE_URL": "@nexusforge_supabase_url",
+    "NEXT_PUBLIC_SUPABASE_ANON_KEY": "@nexusforge_supabase_anon_key",
+    "SUPABASE_SERVICE_ROLE_KEY": "@nexusforge_supabase_service_role_key",
+    "OPENAI_API_KEY": "@nexusforge_openai_key",
+    "OPENAI_BASE_URL": "@nexusforge_openai_base_url"
+  }
+}
