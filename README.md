@@ -7,8 +7,8 @@
 
 | Entorno | URL |
 |---|---|
-| **Producción** | https://nexusforge-vercel.vercel.app |
-| **Dashboard Vercel** | https://vercel.com/rauldiazespejo-ctrls-projects/nexusforge-vercel |
+| **Producción** | https://simforge3d.vercel.app |
+| **Dashboard Vercel** | https://vercel.com/rauldiazespejo-ctrls-projects/simforge3d |
 | **GitHub (rama vercel)** | https://github.com/rauldiazespejo-ctrl/Simulador3D/tree/vercel |
 
 ---
@@ -46,7 +46,7 @@ Ve a **Settings → API** y copia:
 ### 4 — Actualizar variables en Vercel
 
 **Opción A — Dashboard Vercel:**
-1. Ve a https://vercel.com/rauldiazespejo-ctrls-projects/nexusforge-vercel/settings/environment-variables
+1. Ve a https://vercel.com/rauldiazespejo-ctrls-projects/simforge3d/settings/environment-variables
 2. Edita `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`
 3. Haz un nuevo deploy (Settings → Deployments → Redeploy)
 
