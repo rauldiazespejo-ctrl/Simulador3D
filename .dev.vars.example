@@ -1,0 +1,2 @@
+OPENAI_API_KEY=tu-api-key-aqui
+OPENAI_BASE_URL=https://www.genspark.ai/api/llm_proxy/v1
